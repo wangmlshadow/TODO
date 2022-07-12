@@ -8,13 +8,20 @@
 - [ ] https://github.com/TheAlgorithms/Python
 - [ ] https://github.com/qiurunze123/zookeeperDesign
 - [ ] https://github.com/apache/incubator-brpc/blob/master/docs/cn/
-- [ ] 
+- [X] https://github.com/google/leveldb/blob/main/doc/index.md
+
+# 官方技术博客
+- [] 百度：https://blog.csdn.net/lihui49?type=blog
+- [] 美团：https://tech.meituan.com/
 
 ## blog
 > 搜过看过并且觉得有用的blog
 > - 新知识
 > - 新技能
 > - 解决了某个当时存在的问题
+
+## Projects
+- [ ] https://zookeeper.apache.org/releases.html
 
 C++
 - DISALLOW_COPY_AND_ASSIGN
