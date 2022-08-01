@@ -1,7 +1,6 @@
 # TODO
 > 当一个收藏夹
 
-
 ## github repo
 > 下次一定的repo:)
 - [ ] https://github.com/mtdvio/every-programmer-should-know
@@ -10,6 +9,7 @@
 - [ ] https://github.com/qiurunze123/zookeeperDesign
 - [ ] https://github.com/apache/incubator-brpc/blob/master/docs/cn/
 - [X] https://github.com/google/leveldb/blob/main/doc/index.md
+- [X] https://github.com/sunym1993/flash-linux0.11-talk
 
 # 官方技术博客
 - [] 百度：https://blog.csdn.net/lihui49?type=blog
@@ -79,6 +79,7 @@ Other
   - https://blog.csdn.net/MOU_IT/article/details/117152605
   - Slice：https://blog.csdn.net/qq_29983883/article/details/107403243
   - 源码解析：https://www.zhihu.com/column/c_1282795241104465920
+  - https://blog.csdn.net/mou_it/category_11064244.html
 - tmux配置
   - https://blog.csdn.net/weixin_51216553/article/details/123954679
   - http://t.zoukankan.com/scue-p-3705309.html
