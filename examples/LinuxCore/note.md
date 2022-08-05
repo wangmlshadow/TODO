@@ -766,3 +766,308 @@ void main(void)		/* This really IS void, no error here. */
 > - 第四部分是个死循环，如果没有任何任务可以运行，操作系统会一直陷入这个死循环无法自拔。
 
 ## 管理内存前先划分出三个边界值
+```c
+void main(void)		/* This really IS void, no error here. */
+{			/* The startup routine assumes (well, ...) this */
+    ...
+	memory_end = (1<<20) + (EXT_MEM_K<<10);
+	memory_end &= 0xfffff000;
+	if (memory_end > 16*1024*1024)
+		memory_end = 16*1024*1024;
+	if (memory_end > 12*1024*1024) 
+		buffer_memory_end = 4*1024*1024;
+	else if (memory_end > 6*1024*1024)
+		buffer_memory_end = 2*1024*1024;
+	else
+		buffer_memory_end = 1*1024*1024;
+	main_memory_start = buffer_memory_end;
+	...
+}
+```
+> **针对不同的内存大小，设置不同的边界值**，即主内存和缓冲区的内存范围
+
+## 操作系统就用一张大表管理内存
+> git/Linux-0.11code/mm/memory.c
+```c
+/* these are not to be changed without changing head.s etc */
+#define LOW_MEM 0x100000
+#define PAGING_MEMORY (15*1024*1024)
+#define PAGING_PAGES (PAGING_MEMORY>>12)
+#define MAP_NR(addr) (((addr)-LOW_MEM)>>12)
+#define USED 100
+
+#define CODE_SPACE(addr) ((((addr)+4095)&~4095) < \
+current->start_code + current->end_code)
+
+static long HIGH_MEMORY = 0;
+
+#define copy_page(from,to) \
+__asm__("cld ; rep ; movsl"::"S" (from),"D" (to),"c" (1024):"cx","di","si")
+
+static unsigned char mem_map [ PAGING_PAGES ] = {0,};
+// mem_init(main_memory_start,memory_end); // 内存初始化
+void mem_init(long start_mem, long end_mem)
+{
+	int i;
+
+	HIGH_MEMORY = end_mem;
+	for (i=0 ; i<PAGING_PAGES ; i++)
+		mem_map[i] = USED;
+	i = MAP_NR(start_mem);
+	end_mem -= start_mem;
+	end_mem >>= 12;
+	while (end_mem-->0)
+		mem_map[i++]=0;
+}
+```
+> mem_init做的事就是准备了一个表，记录了哪些内存被占用了，哪些内存没被占用。
+> mem_map 这个数组的每个元素都代表一个 4K 内存是否空闲（准确说是使用次数）。4K 内存通常叫做 1 页内存，而这种管理方式叫分页管理，就是把内存分成一页一页（4K）的单位去管理。
+> 1M 以下的内存这个数组干脆没有记录，这里的内存是无需管理的，或者换个说法是无权管理的，也就是没有权利申请和释放，因为这个区域是内核代码所在的地方，不能被“污染”。
+> 1M 到 2M 这个区间是缓冲区，2M 是缓冲区的末端，缓冲区的开始在哪里之后再说，这些地方不是主内存区域，因此直接标记为 USED，产生的效果就是无法再被分配了。
+> 2M 以上的空间是主内存区域，而主内存目前没有任何程序申请，所以初始化时统统都是零，未来等着应用程序去申请和释放这里的内存资源。
+
+**程序申请内存**
+```c
+/*
+ * Get physical address of first (actually last :-) free page, and mark it
+ * used. If no free pages left, return 0.
+ */
+unsigned long get_free_page(void)
+{
+register unsigned long __res asm("ax");
+
+__asm__("std ; repne ; scasb\n\t"
+	"jne 1f\n\t"
+	"movb $1,1(%%edi)\n\t"
+	"sall $12,%%ecx\n\t"
+	"addl %2,%%ecx\n\t"
+	"movl %%ecx,%%edx\n\t"
+	"movl $1024,%%ecx\n\t"
+	"leal 4092(%%edx),%%edi\n\t"
+	"rep ; stosl\n\t"
+	"movl %%edx,%%eax\n"
+	"1:"
+	:"=a" (__res)
+	:"0" (0),"i" (LOW_MEM),"c" (PAGING_PAGES),
+	"D" (mem_map+PAGING_PAGES-1)
+	:"di","cx","dx");
+return __res;
+}
+```
+> 选择 mem_map 中首个空闲页面，并标记为已使用。
+
+## 你的键盘什么时候生效
+> git/Linux-0.11code/kernel/traps.c
+```c
+// trap_init();  // 中断初始化
+void trap_init(void)
+{
+	int i;
+
+	set_trap_gate(0,&divide_error);
+	set_trap_gate(1,&debug);
+	set_trap_gate(2,&nmi);
+	set_system_gate(3,&int3);	/* int3-5 can be called from all */
+	set_system_gate(4,&overflow);
+	set_system_gate(5,&bounds);
+	set_trap_gate(6,&invalid_op);
+	set_trap_gate(7,&device_not_available);
+	set_trap_gate(8,&double_fault);
+	set_trap_gate(9,&coprocessor_segment_overrun);
+	set_trap_gate(10,&invalid_TSS);
+	set_trap_gate(11,&segment_not_present);
+	set_trap_gate(12,&stack_segment);
+	set_trap_gate(13,&general_protection);
+	set_trap_gate(14,&page_fault);
+	set_trap_gate(15,&reserved);
+	set_trap_gate(16,&coprocessor_error);
+	for (i=17;i<48;i++)
+		set_trap_gate(i,&reserved);
+	set_trap_gate(45,&irq13);
+	outb_p(inb_p(0x21)&0xfb,0x21);
+	outb(inb_p(0xA1)&0xdf,0xA1);
+	set_trap_gate(39,&parallel_interrupt);
+}
+```
+> git/Linux-0.11/include/asm/system.h
+```c
+// 效果就是在中断描述符表中插入了一个中断描述符。
+#define _set_gate(gate_addr,type,dpl,addr) \
+__asm__ ("movw %%dx,%%ax\n\t" \
+	"movw %0,%%dx\n\t" \
+	"movl %%eax,%1\n\t" \
+	"movl %%edx,%2" \
+	: \
+	: "i" ((short) (0x8000+(dpl<<13)+(type<<8))), \
+	"o" (*((char *) (gate_addr))), \
+	"o" (*(4+(char *) (gate_addr))), \
+	"d" ((char *) (addr)),"a" (0x00080000))
+
+#define set_intr_gate(n,addr) \
+	_set_gate(&idt[n],14,0,addr)
+
+#define set_trap_gate(n,addr) \
+	_set_gate(&idt[n],15,0,addr)
+
+#define set_system_gate(n,addr) \
+	_set_gate(&idt[n],15,3,addr)
+```
+> 这段代码就是往这个 idt 表里一项一项地写东西，其对应的中断号就是第一个参数，中断处理程序就是第二个参数。产生的效果就是，之后如果来一个中断后，CPU 根据其中断号，就可以到这个中断描述符表 idt 中找到对应的中断处理程序了。
+> 这个 system 与 trap 的区别仅仅在于，设置的中断描述符的特权级不同，前者是 0（内核态），后者是 3（用户态），这块展开将会是非常严谨的、绕口的、复杂的特权级相关的知识，不明白的话先不用管，就理解为都是设置一个中断号和中断处理程序的对应关系就好了。
+> 17 到 48 号中断都批量设置为了 reserved 函数，这是暂时的，后面各个硬件初始化时要重新设置好这些中断，把暂时的这个给覆盖掉。
+
+```c
+void tty_init(void)
+{
+	rs_init();
+	con_init();
+}
+
+/*
+ *  void con_init(void);
+ *
+ * This routine initalizes console interrupts, and does nothing
+ * else. If you want the screen to clear, call tty_write with
+ * the appropriate escape-sequece.
+ *
+ * Reads the information preserved by setup.s to determine the current display
+ * type and sets everything accordingly.
+ */
+void con_init(void)
+{
+	...
+	set_trap_gate(0x21,&keyboard_interrupt);
+	...
+}
+/* from bsd-net-2: */
+```
+> 设置键盘相关的中断
+> 虽然设置了键盘中断，但是到目前为止这些中断还是处于禁用状态
+
+```c
+// sti(); // main
+#define sti() __asm__ ("sti"::)
+```
+> sti 最终会对应一个同名的汇编指令 sti，表示允许中断。所以这行代码之后，键盘才真正开始生效！
+
+## 读取硬盘前的准备工作有哪些
+> git/Linux-0.11code/kernel/blk_drv/ll_rw_blk.c
+```c
+// blk_dev_init() // main()
+void blk_dev_init(void)
+{
+	int i;
+
+	for (i=0 ; i<NR_REQUEST ; i++) {
+		request[i].dev = -1;
+		request[i].next = NULL;
+	}
+}
+```
+> git/Linux-0.11code/kernel/blk_drv/blk.h
+```c
+/*
+ * Ok, this is an expanded form so that we can use the same
+ * request for paging requests when that is implemented. In
+ * paging, 'bh' is NULL, and 'waiting' is used to wait for
+ * read/write completion.
+ */
+struct request {
+	int dev;		/* -1 if no request 表示设备号，-1 就表示空闲。 */
+	int cmd;		/* READ or WRITE 表示命令，其实就是 READ 还是 WRITE，也就表示本次操作是读还是写。 */
+	int errors;     /* 表示操作时产生的错误次数。 */
+	unsigned long sector;          // 表示起始扇区。
+	unsigned long nr_sectors;      // 表示扇区数。
+	char * buffer;                 // 表示数据缓冲区，也就是读盘之后的数据放在内存中的什么位置。
+	struct task_struct * waiting;  // 是个 task_struct 结构，这可以表示一个进程，也就表示是哪个进程发起了这个请求。
+	struct buffer_head * bh;       // 是缓冲区头指针
+	struct request * next;         // 指向了下一个请求项。
+};
+```
+> 比如读请求时，cmd 就是 READ，sector 和 nr_sectors 这俩就定位了所要读取的块设备（可以简单先理解为硬盘）的哪几个扇区，buffer 就定位了这些数据读完之后放在内存的什么位置。
+>  request 结构可以完整描述一个读盘操作。然后那个 request 数组就是把它们都放在一起，并且它们又通过 next 指针串成链表。
+
+**读盘操作**
+> 读操作的系统调用函数是 sys_read
+> 简化版函数如下：
+```c
+int sys_read(unsigned int fd,char * buf,int count) {
+    struct file * file = current->filp[fd];  // 在进程文件描述符数组filp中找到一个空闲项  在系统文件表file_table中找到一个空闲项
+    struct m_inode * inode = file->f_inode;  // 根据文件名从文件系统中查找inode
+    // 校验 buf 区域的内存限制
+    verify_area(buf,count);
+    // 仅关注目录文件或普通文件
+    return file_read(inode,file,buf,count);
+}
+```
+> 入参 fd 是文件描述符，通过它可以找到一个文件的 inode，进而找到这个文件在硬盘中的位置。另两个入参 buf 就是要复制到的内存中的位置，count 就是要复制多少个字节。
+```c
+int file_read(struct m_inode * inode, struct file * filp, char * buf, int count) {
+    int left,chars,nr;
+    struct buffer_head * bh;
+    left = count;
+    while (left) {  // 每次读入一个块的数据，直到入参所要求的大小全部读完为止。
+        if (nr = bmap(inode,(filp->f_pos)/BLOCK_SIZE)) {
+            if (!(bh=bread(inode->i_dev,nr)))  // 这个函数就是去读某一个设备的某一个数据块号的内容
+                break;
+        } else
+            bh = NULL;
+        nr = filp->f_pos % BLOCK_SIZE;
+        chars = MIN( BLOCK_SIZE-nr , left );
+        filp->f_pos += chars;
+        left -= chars;
+        if (bh) {
+            char * p = nr + bh->b_data;
+            while (chars-->0)
+                put_fs_byte(*(p++),buf++);
+            brelse(bh);
+        } else {
+            while (chars-->0)
+                put_fs_byte(0,buf++);
+        }
+    }
+    inode->i_atime = CURRENT_TIME;
+    return (count-left)?(count-left):-ERROR;
+}
+
+struct buffer_head * bread(int dev,int block) {
+    struct buffer_head * bh = getblk(dev,block);  // 申请了一个内存中的缓冲块
+    if (bh->b_uptodate)
+        return bh;
+    ll_rw_block(READ,bh);  //  ll_rw_block 负责把数据读入这个缓冲块
+    wait_on_buffer(bh);
+    if (bh->b_uptodate)
+        return bh;
+    brelse(bh);
+    return NULL;
+}
+
+void ll_rw_block(int rw, struct buffer_head * bh) {
+    ...
+    make_request(major,rw,bh);
+}
+
+static void make_request(int major,int rw, struct buffer_head * bh) { // 该函数会往刚刚的设备的请求项链表 request[32] 中添加一个请求项，只要 request[32] 中有未处理的请求项存在，都会陆续地被处理，直到设备的请求项链表是空为止。
+    ...
+if (rw == READ)
+        req = request+NR_REQUEST;
+    else
+        req = request+((NR_REQUEST*2)/3);
+/* find an empty request */
+    while (--req >= request)
+        if (req->dev<0)
+            break;
+    ...
+/* fill up the request-info, and add it to the queue */
+    req->dev = bh->b_dev;
+    req->cmd = rw;
+    req->errors=0;
+    req->sector = bh->b_blocknr<<1;
+    req->nr_sectors = 2;
+    req->buffer = bh->b_data;
+    req->waiting = NULL;
+    req->bh = bh;
+    req->next = NULL;
+    add_request(major+blk_dev,req);
+}
+```
