@@ -1869,3 +1869,910 @@ void main(void) {
 0x21				keyboard_interrupt
 0x2E				hd_interrupt
 0x80				system_call
+
+## 一个新进程的诞生
+> 简单说就是从内核态切换到用户态，然后通过 fork 创建出一个新的进程，再之后老进程进入死循环。
+```c
+void main(void)		/* This really IS void, no error here. */
+{			/* The startup routine assumes (well, ...) this */
+    ...
+	move_to_user_mode();
+	if (!fork()) {		/* we count on this going ok */
+		init();
+	}
+/*
+ *   NOTE!!   For any other task 'pause()' would mean we have to get a
+ * signal to awaken, but task0 is the sole exception (see 'schedule()')
+ * as task 0 gets activated at every idle moment (when no other tasks
+ * can run). For task0 'pause()' just means we go check if some other
+ * task can run, and if not we return here.
+ */
+	for(;;) pause();
+}
+```
+> move_to_user_mode 就是转变为用户态模式。因为 Linux 将操作系统特权级分为用户态与内核态两种，之前都处于内核态，现在要先转变为用户态。一旦转变为了用户态，那么之后的代码将一直处于用户态的模式，除非发生了中断，比如用户发出了系统调用的中断指令，那么此时将会从用户态陷入内核态，不过当中断处理程序执行完之后，又会通过中断返回指令从内核态回到用户态。整个过程被操作系统的机制拿捏的死死的，始终让用户进程处于用户态运行，必要的时候陷入一下内核态，但很快就会被返回而再次回到用户态。
+> fork 创建一个新进程的意思，而且所有用户进程想要创建新的进程，都需要调用这个函数。原来操作系统只有一个执行流，就是我们一直看过来的所有代码，就是进程 0，只不过我们并没有意识到它也是一个进程。调用完 fork 之后，现在又多了一个进程，叫做进程 1。更准确的说法是，我们一路看过来的代码能够被我们自信地称作进程 0 的确切时刻，是我们在 第18回 | 进程调度初始化 sched_init 里为当前执行流添加了一个进程管理结构到 task 数组里，同时开启了定时器以及时钟中断的那一个时刻。因为此时时钟中断到来之后，就可以执行到我们的进程调度程序，进程调度程序才会去这个 task 数组里挑选合适的进程进行切换。所以此时，我们当前执行的代码，才真正有了一个进程的身份，才勉强得到了一个可以被称为进程 0 的资格，毕竟还没有其他进程参与竞争。
+> init 只有进程 1 会走到这个分支来执行。这里的代码可太多了，它本身需要完成如加载根文件系统的任务，同时这个方法将又会创建出一个新的进程 2，在进程 2 里又会加载与用户交互的 shell 程序，此时操作系统就正式成为了用户可用的一个状态了。
+> pause 当没有任何可运行的进程时，操作系统会悬停在这里，达到怠速状态。没啥好说的，我一直强调，操作系统就是由中断驱动的一个死循环。
+
+## 从内核态到用户态
+**进程无法逃出用户态**
+> move_to_user_mode 这行代码，作用就是将当前代码的特权级，从内核态变为用户态。一旦转变为了用户态，那么之后的代码将一直处于用户态的模式，除非发生了中断，比如用户发出了系统调用的中断指令，那么此时将会从用户态陷入内核态，不过当中断处理程序执行完之后，又会通过中断返回指令从内核态回到用户态。
+**内核态与用户态的本质-特权级**
+> 首先从一个最大的视角来看，这一切都源于 CPU 的保护机制。CPU 为了配合操作系统完成保护机制这一特性，分别设计了分段保护机制与分页保护机制。
+> 当前代码所处段的特权级，必须要等于要跳转过去的代码所处的段的特权级，那就只能用户态往用户态跳，内核态往内核态跳，这样就防止了处于用户态的程序，跳转到内核态的代码段中做坏事。
+> 此外还有访问内存数据时也会有数据段的特权级检查，这里就不展开了。最终的效果是，处于内核态的代码可以访问任何特权级的数据段，处于用户态的代码则只可以访问用户态的数据段，这也就实现了内存数据读写的保护。
+> **代码跳转只能同特权级，数据访问只能高特权级访问低特权级。**
+**特权级转换的方式**
+> Intel 设计了好多种特权级转换的方式，中断和中断返回就是其中的一种。
+> 处于用户态的程序，通过触发中断，可以进入内核态，之后再通过中断返回，又可以恢复为用户态。
+> 而系统调用就是这么玩的，用户通过 int 0x80 中断指令触发了中断，CPU 切换至内核态，执行中断处理程序，之后中断程序返回，又从内核态切换回用户态。
+> 但有个问题是，我们当前的代码，此时就是处于内核态，并不是由一个用户态程序通过中断而切换到的内核态，那怎么回到原来的用户态呢？答案还是，通过中断返回。
+> 没有中断也能中断返回？可以的，Intel 设计的 CPU 就是这样不符合人们的直觉，中断和中断返回的确是应该配套使用的，但也可以单独使用，我们看代码。
+```c
+// git/Linux-0.11/include/asm/system.h
+#define move_to_user_mode() \
+__asm__ ("movl %%esp,%%eax\n\t" \
+	"pushl $0x17\n\t" \
+	"pushl %%eax\n\t" \
+	"pushfl\n\t" \
+	"pushl $0x0f\n\t" \
+	"pushl $1f\n\t" \
+	"iret\n" \ // 中断返回
+	"1:\tmovl $0x17,%%eax\n\t" \
+	"movw %%ax,%%ds\n\t" \
+	"movw %%ax,%%es\n\t" \
+	"movw %%ax,%%fs\n\t" \
+	"movw %%ax,%%gs" \
+	:::"ax")
+```
+> 那么为什么之前进行了一共五次的压栈操作呢？因为中断返回理论上就是应该和中断配合使用的，而此时并不是真的发生了中断到这里，所以我们得假装发生了中断才行。
+> 怎么假装呢？其实就把栈做做工作就好了，中断发生时，CPU 会自动帮我们做如下的压栈操作。而中断返回时，CPU 又会帮我们把压栈的这些值返序赋值给响应的寄存器。
+> 去掉错误码，刚好是五个参数，所以我们在代码中模仿 CPU 进行了五次压栈操作，这样在执行 iretd 指令时，硬件会按顺序将刚刚压入栈中的数据，分别赋值给 SS、ESP、EFLAGS、CS、EIP 这几个寄存器，这就感觉像是正确返回了一样，让其误以为这是通过中断进来的。
+
+## 如果让你来设计进程调度
+> 进程调度本质是什么？很简单，假如有三段代码被加载到内存中。 进程调度就是让 CPU 一会去程序 1 的位置处运行一段时间，一会去程序 2 的位置处运行一段时间。
+**那么如何实现上述的CPU运行方式呢**
+> 第一种办法就是，程序 1 的代码里，每隔几行就写一段代码，主动放弃自己的执行权，跳转到程序 2 的地方运行。然后程序 2 也是如此。但这种依靠程序自己的办法肯定不靠谱。
+> 第二种办法就是，由一个不受任何程序控制的，第三方的不可抗力，每隔一段时间就中断一下 CPU 的运行，然后跳转到一个特殊的程序那里，这个程序通过某种方式获取到 CPU 下一个要运行的程序的地址，然后跳转过去。这个每隔一段时间就中断 CPU 的不可抗力，就是由定时器触发的时钟中断。
+> **而这个时钟中断在sched_init函数里已经设置过了**
+> 这个特殊的程序，就是具体的进程调度函数。
+**上下文环境**
+> 每个程序最终的本质就是执行指令。这个过程会涉及寄存器，内存和外设端口。
+> **寄存器上下文**
+> 每次切换进程时，都把当前这些寄存器的值存到一个地方，以便之后切换回来的时候恢复。Linux 0.11 就是这样做的，每个进程的结构 task_struct 里面，有一个叫 tss 的结构，存储的就是 CPU 这些寄存器的信息。
+```c
+// git/Linux-0.11code/kernel/sched.c
+struct task_struct {
+/* these are hardcoded - don't touch */
+	long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+	long counter;
+	long priority;  /* 每次一个进程初始化时，都把 counter 赋值为这个 priority，而且当 counter 减为 0 时，下一次分配时间片，也赋值为这个。 */
+	long signal;
+	struct sigaction sigaction[32];
+	long blocked;	/* bitmap of masked signals */
+/* various fields */
+	int exit_code;
+	unsigned long start_code,end_code,end_data,brk,start_stack;
+	long pid,father,pgrp,session,leader;
+	unsigned short uid,euid,suid;
+	unsigned short gid,egid,sgid;
+	long alarm;
+	long utime,stime,cutime,cstime,start_time;
+	unsigned short used_math;
+/* file system info */
+	int tty;		/* -1 if no tty, so it must be signed */
+	unsigned short umask;
+	struct m_inode * pwd;
+	struct m_inode * root;
+	struct m_inode * executable;
+	unsigned long close_on_exec;
+	struct file * filp[NR_OPEN];
+/* ldt for this task 0 - zero 1 - cs 2 - ds&ss */
+	struct desc_struct ldt[3];
+/* tss for this task */
+	struct tss_struct tss;
+};
+
+struct tss_struct {
+	long	back_link;	/* 16 high bits zero */
+	long	esp0;
+	long	ss0;		/* 16 high bits zero */
+	long	esp1;
+	long	ss1;		/* 16 high bits zero */
+	long	esp2;
+	long	ss2;		/* 16 high bits zero */
+	long	cr3;        /* 表示 cr3 寄存器里存的值，而 cr3 寄存器是指向页目录表首地址的。 */
+	long	eip;
+	long	eflags;
+	long	eax,ecx,edx,ebx;
+	long	esp;
+	long	ebp;
+	long	esi;
+	long	edi;
+	long	es;		/* 16 high bits zero */
+	long	cs;		/* 16 high bits zero */
+	long	ss;		/* 16 high bits zero */
+	long	ds;		/* 16 high bits zero */
+	long	fs;		/* 16 high bits zero */
+	long	gs;		/* 16 high bits zero */
+	long	ldt;		/* 16 high bits zero */
+	long	trace_bitmap;	/* bits: trace 0, bitmap 16-31 */
+	struct i387_struct i387;
+};
+```
+> **内存上下文**
+> cr3 寄存器是指向页目录表首地址的。那么指向不同的页目录表，整个页表结构就是完全不同的一套，那么线性地址到物理地址的映射关系就有能力做到不同。也就是说，在我们刚刚假设的理想情况下，不同程序用不同的内存地址可以做到内存互不干扰。但是有了这个 cr3 字段，就完全可以无需由各个进程自己保证不和其他进程使用的内存冲突，因为只要建立不同的映射关系即可，由操作系统来建立不同的页目录表并替换 cr3 寄存器即可。当然 Linux 0.11 并不是通过替换 cr3 寄存器来实现内存互不干扰的，它的实现更为简单。
+> **运行时间信息**
+> 如何判断一个进程该让出 CPU 了，切换到下一个进程呢？总不能是每次时钟中断时都切换一次吧？一来这样不灵活，二来这完全依赖时钟中断的频率，有点危险。所以一个好的办法就是，给进程一个属性，叫剩余时间片，每次时钟中断来了之后都 -1，如果减到 0 了，就触发切换进程的操作。在 Linux 0.11 里，这个属性就是 counter。
+```c
+// git/Linux-0.11code/kernel/sched.c
+void do_timer(long cpl)
+{
+	extern int beepcount;
+	extern void sysbeepstop(void);
+
+	if (beepcount)
+		if (!--beepcount)
+			sysbeepstop();
+
+	if (cpl)
+		current->utime++;
+	else
+		current->stime++;
+
+	if (next_timer) {
+		next_timer->jiffies--;
+		while (next_timer && next_timer->jiffies <= 0) {
+			void (*fn)(void);
+			
+			fn = next_timer->fn;
+			next_timer->fn = NULL;
+			next_timer = next_timer->next;
+			(fn)();
+		}
+	}
+	if (current_DOR & 0xf0)
+		do_floppy_timer();
+	if ((--current->counter)>0) return;  // 每次中断都判断一下是否到 0 了
+	current->counter=0;
+	if (!cpl) return;
+	schedule();  // 如果已经到 0 了，就触发进程调度，选择下一个进程并使 CPU 跳转到那里运行。
+}
+```
+> **优先级**
+> 上面那个 counter 一开始的时候该是多少呢？而且随着 counter 不断递减，减到 0 时，下一轮回中这个 counter 应该赋予什么值呢？其实这俩问题都是一个问题，就是 counter 的初始化问题，也需要有一个属性来记录这个值。往宏观想一下，这个值越大，那么 counter 就越大，那么每次轮到这个进程时，它在 CPU 中运行的时间就越长，也就是这个进程比其他进程得到了更多 CPU 运行的时间。
+> 每次一个进程初始化时，都把 counter 赋值为这个 priority，而且当 counter 减为 0 时，下一次分配时间片，也赋值为这个。
+> **进程状态**
+```c
+// /root/git/Linux-0.11code/include/linux/sched.h
+#define TASK_RUNNING		0
+#define TASK_INTERRUPTIBLE	1
+#define TASK_UNINTERRUPTIBLE	2
+#define TASK_ZOMBIE		3
+#define TASK_STOPPED		4
+```
+
+## 从一次定时器滴答来看进程调度
+> sched_init 开启了定时器，这个定时器每隔一段时间就会向 CPU 发起一个中断信号。这个间隔时间被设置为 10 ms，也就是 100 Hz。发起的中断叫时钟中断，其中断向量号被设置为了 0x20。这样，当时钟中断，也就是 0x20 号中断来临时，CPU 会查找中断向量表中 0x20 处的函数地址，即中断处理函数，并跳转过去执行。这个中断处理函数就是 timer_interrupt。
+> git/Linux-0.11code/kernel/system_call.s
+```bash
+.align 2
+_timer_interrupt:
+	push %ds		# save ds,es and put kernel data space
+	push %es		# into them. %fs is used by _system_call
+	push %fs
+	pushl %edx		# we save %eax,%ecx,%edx as gcc doesn't
+	pushl %ecx		# save those across function calls. %ebx
+	pushl %ebx		# is saved as we use that in ret_sys_call
+	pushl %eax
+	movl $0x10,%eax
+	mov %ax,%ds
+	mov %ax,%es
+	movl $0x17,%eax
+	mov %ax,%fs
+	incl _jiffies       # 将系统滴答数这个变量 jiffies 加一
+	movb $0x20,%al		# EOI to interrupt controller #1
+	outb %al,$0x20
+	movl CS(%esp),%eax
+	andl $3,%eax		# %eax is CPL (0 or 3, 0=supervisor)
+	pushl %eax
+	call _do_timer		# 'do_timer(long CPL)' does everything from 调用了另一个函数 do_timer。
+	addl $4,%esp		# task switching to accounting ...
+	jmp ret_from_sys_call
+```
+> git/Linux-0.11code/kernel/sched.c
+```c
+void do_timer(long cpl)
+{
+	extern int beepcount;
+	extern void sysbeepstop(void);
+
+	if (beepcount)
+		if (!--beepcount)
+			sysbeepstop();
+
+	if (cpl)
+		current->utime++;
+	else
+		current->stime++;
+
+	if (next_timer) {
+		next_timer->jiffies--;
+		while (next_timer && next_timer->jiffies <= 0) {
+			void (*fn)(void);
+			
+			fn = next_timer->fn;
+			next_timer->fn = NULL;
+			next_timer = next_timer->next;
+			(fn)();
+		}
+	}
+	if (current_DOR & 0xf0)
+		do_floppy_timer();
+	if ((--current->counter)>0) return;
+	current->counter=0;
+	if (!cpl) return;
+	schedule();
+}
+
+/*
+ *  'schedule()' is the scheduler function. This is GOOD CODE! There
+ * probably won't be any reason to change this, as it should work well
+ * in all circumstances (ie gives IO-bound processes good response etc).
+ * The one thing you might take a look at is the signal-handler code here.
+ *
+ *   NOTE!!  Task 0 is the 'idle' task, which gets called when no other
+ * tasks can run. It can not be killed, and it cannot sleep. The 'state'
+ * information in task[0] is never used.
+ */
+void schedule(void)
+{
+	int i,next,c;
+	struct task_struct ** p;
+
+/* check alarm, wake up any interruptible tasks that have got a signal */
+
+	for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
+		if (*p) {
+			if ((*p)->alarm && (*p)->alarm < jiffies) {
+					(*p)->signal |= (1<<(SIGALRM-1));
+					(*p)->alarm = 0;
+				}
+			if (((*p)->signal & ~(_BLOCKABLE & (*p)->blocked)) &&
+			(*p)->state==TASK_INTERRUPTIBLE)
+				(*p)->state=TASK_RUNNING;
+		}
+
+/* this is the scheduler proper: */
+
+	while (1) {
+		c = -1;
+		next = 0;
+		i = NR_TASKS;
+		p = &task[NR_TASKS];
+		while (--i) {
+			if (!*--p)
+				continue;
+			if ((*p)->state == TASK_RUNNING && (*p)->counter > c)
+				c = (*p)->counter, next = i;
+		}
+		if (c) break;
+		for(p = &LAST_TASK ; p > &FIRST_TASK ; --p)
+			if (*p)
+				(*p)->counter = ((*p)->counter >> 1) +
+						(*p)->priority;
+	}
+	switch_to(next);
+}
+```
+**schedule() **
+1. 拿到剩余时间片（counter的值）最大且在 runnable 状态（state = 0）的进程号 next。
+2. 如果所有 runnable 进程时间片都为 0，则将所有进程（注意不仅仅是 runnable 的进程）的 counter 重新赋值（counter = counter/2 + priority），然后再次执行步骤 1。
+3. 最后拿到了一个进程号 next，调用了 switch_to(next) 这个方法，就切换到了这个进程去执行了。
+```c
+// git/Linux-0.11code/include/linux/sched.h
+/*
+ *	switch_to(n) should switch tasks to task nr n, first
+ * checking that n isn't the current task, in which case it does nothing.
+ * This also clears the TS-flag if the task we switched to has used
+ * tha math co-processor latest.
+ */
+#define switch_to(n) {\
+struct {long a,b;} __tmp; \
+__asm__("cmpl %%ecx,_current\n\t" \
+	"je 1f\n\t" \
+	"movw %%dx,%1\n\t" \
+	"xchgl %%ecx,_current\n\t" \
+	"ljmp %0\n\t" \
+	"cmpl %%ecx,_last_task_used_math\n\t" \
+	"jne 1f\n\t" \
+	"clts\n" \
+	"1:" \
+	::"m" (*&__tmp.a),"m" (*&__tmp.b), \
+	"d" (_TSS(n)),"c" ((long) task[n])); \
+}
+```
+> 这段话就是进程切换的最最最最底层的代码了。其实主要就干了一件事，就是 ljmp 到新进程的 tss 段处。CPU 规定，如果 ljmp 指令后面跟的是一个 tss 段，那么，会由硬件将当前各个寄存器的值保存在当前进程的 tss 中，并将新进程的 tss 信息加载到各个寄存器。
+
+## 通过fork看一次系统调用
+> 看一下fork的实现
+```c
+static inline _syscall0(int,fork)   // 那我们再多说两句，刚刚定义 fork 的系统调用模板函数时，用的是 syscall0，其实这个表示参数个数为 0，也就是 sys_fork 函数并不需要任何参数。
+
+// git/Linux-0.11code/include/unistd.h
+#define _syscall0(type,name) \
+type name(void) \
+{ \
+long __res; \
+__asm__ volatile ("int $0x80" \
+	: "=a" (__res) \
+	: "0" (__NR_##name)); \
+if (__res >= 0) \
+	return (type) __res; \
+errno = -__res; \
+return -1; \
+}
+```
+> 上述代码可以转换成下列形式
+```c
+#define _syscall0(type,name) \
+type name(void) \
+{ \
+    volatile long __res; \
+    _asm { \
+        _asm mov eax,__NR_##name \
+        _asm int 80h \
+        _asm mov __res,eax \
+    } \
+    if (__res >= 0) \
+        return (type) __res; \
+    errno = -__res; \
+    return -1; \
+}
+```
+> 将宏展开就变成了fork
+```c
+int fork(void) {
+     volatile long __res;
+    _asm {
+        _asm mov eax,__NR_fork		// #define __NR_fork	2
+        _asm int 80h   				// 0x80 号软中断的触发，int 80h，set_system_gate(0x80, &system_call);
+        _asm mov __res,eax			
+    }
+    if (__res >= 0)
+        return (void) __res;
+    errno = -__res;
+    return -1;
+}
+```
+> 关键指令就是一个 0x80 号软中断的触发，int 80h。其中还有一个 eax 寄存器里的参数是 __NR_fork，这也是个宏定义，值是 2。0x80 号中断的处理函数么？这个是我们在 第18回 | 大名鼎鼎的进程调度就是从这里开始的 sched_init 里面设置的。
+```c
+set_system_gate(0x80, &system_call);
+
+_system_call:
+    ...
+    call [_sys_call_table + eax*4]   // 刚刚那个值就用上了，eax 寄存器里的值是 2，所以这个就是在这个 sys_call_table 表里找下标 2 位置处的函数，然后跳转过去。
+    ...
+
+// 就是各种函数指针组成的一个数组，说白了就是个系统调用函数表。从第零项开始数，第二项就是 sys_fork 函数！
+fn_ptr sys_call_table[] = { sys_setup, sys_exit, sys_fork, sys_read,
+  sys_write, sys_open, sys_close, sys_waitpid, sys_creat, sys_link,
+  sys_unlink, sys_execve, sys_chdir, sys_time, sys_mknod, sys_chmod,
+  sys_chown, sys_break, sys_stat, sys_lseek, sys_getpid, sys_mount,
+  sys_umount, sys_setuid, sys_getuid, sys_stime, sys_ptrace, sys_alarm,
+  sys_fstat, sys_pause, sys_utime, sys_stty, sys_gtty, sys_access,
+  sys_nice, sys_ftime, sys_sync, sys_kill, sys_rename, sys_mkdir,
+  sys_rmdir, sys_dup, sys_pipe, sys_times, sys_prof, sys_brk, sys_setgid,
+  sys_getgid, sys_signal, sys_geteuid, sys_getegid, sys_acct, sys_phys,
+  sys_lock, sys_ioctl, sys_fcntl, sys_mpx, sys_setpgid, sys_ulimit,
+  sys_uname, sys_umask, sys_chroot, sys_ustat, sys_dup2, sys_getppid,
+  sys_getpgrp, sys_setsid, sys_sigaction, sys_sgetmask, sys_ssetmask,
+  sys_setreuid, sys_setregid
+};
+
+_sys_fork:
+    call _find_empty_process
+    testl %eax,%eax
+    js 1f
+    push %gs
+    pushl %esi
+    pushl %edi
+    pushl %ebp
+    pushl %eax
+    call _copy_process
+    addl $20,%esp
+1:  ret
+```
+**系统调用**
+> 操作系统通过系统调用，提供给用户态可用的功能，都暴露在 sys_call_table 里了。系统调用统一通过 int 0x80 中断来进入，具体调用这个表里的哪个功能函数，就由 eax 寄存器传过来，这里的值是个数组索引的下标，通过这个下标就可以找到在 sys_call_table 这个数组里的具体函数。同时也可以看出，用户进程调用内核的功能，可以直接通过写一句 int 0x80 汇编指令，并且给 eax 赋值，当然这样就比较麻烦。所以也可以直接调用 fork 这样的包装好的方法，而这个方法里本质也是 int 0x80 以及 eax 赋值而已。
+
+```c
+#define _syscall0(type,name)
+#define _syscall1(type,name,atype,a)
+#define _syscall2(type,name,atype,a,btype,b)
+#define _syscall3(type,name,atype,a,btype,b,ctype,c)
+```
+> 其实 syscall1 就表示有一个参数，syscall2 就表示有两个参数。
+> 那这些参数放在哪里了呢？总得有个约定的地方吧？我们看一个今后要讲的重点函数，execve，是一个通常和 fork 在一起配合的变身函数，在之后的进程 1 创建进程 2 的过程中，就是这样玩的。
+```c
+// git/Linux-0.11code/init/main.c
+void init(void) {
+    ...
+    if (!(pid=fork())) {
+        ...
+        execve("/bin/sh",argv_rc,envp_rc);
+        ...
+    }
+}
+
+execve("/bin/sh",argv_rc,envp_rc);
+
+// git/Linux-0.11code/include/unistd.h
+_syscall3(int,execve,const char *,file,char **,argv,char **,envp)
+
+#define _syscall3(type,name,atype,a,btype,b,ctype,c) \
+type name(atype a,btype b,ctype c) { \
+    volatile long __res; \
+    _asm { \
+        _asm mov eax,__NR_##name \
+        _asm mov ebx,a \
+        _asm mov ecx,b \
+        _asm mov edx,c \
+        _asm int 80h \
+        _asm mov __res,eax\
+    } \
+    if (__res >= 0) \
+        return (type) __res; \
+    errno = -__res; \
+    return -1; \
+}
+
+_system_call:
+    cmpl $nr_system_calls-1,%eax
+    ja bad_sys_call
+    push %ds
+    push %es
+    push %fs
+    pushl %edx
+    pushl %ecx      # push %ebx,%ecx,%edx as parameters
+    pushl %ebx      # to the system call
+    movl $0x10,%edx     # set up ds,es to kernel space
+    mov %dx,%ds
+    mov %dx,%es
+    movl $0x17,%edx     # fs points to local data space
+    mov %dx,%fs
+    call _sys_call_table(,%eax,4)
+    pushl %eax
+    movl _current,%eax
+    cmpl $0,state(%eax)     # state
+    jne reschedule
+    cmpl $0,counter(%eax)       # counter
+    je reschedule
+ret_from_sys_call:
+    movl _current,%eax      # task[0] cannot have signals
+    cmpl _task,%eax
+    je 3f
+    cmpw $0x0f,CS(%esp)     # was old code segment supervisor ?
+    jne 3f
+    cmpw $0x17,OLDSS(%esp)      # was stack segment = 0x17 ?
+    jne 3f
+    movl signal(%eax),%ebx
+    movl blocked(%eax),%ecx
+    notl %ecx
+    andl %ebx,%ecx
+    bsfl %ecx,%ecx
+    je 3f
+    btrl %ecx,%ebx
+    movl %ebx,signal(%eax)
+    incl %ecx
+    pushl %ecx
+    call _do_signal
+    popl %eax
+3:  popl %eax
+    popl %ebx
+    popl %ecx
+    popl %edx
+    pop %fs
+    pop %es
+    pop %ds
+    iret
+```
+> 就是 CPU 中断压入的 5 个值，加上 system_call 手动压入的 7 个值。中断处理程序如果有需要的话，就可以从这里取出它想要的值，包括 CPU 压入的那五个值，或者 system_call 手动压入的 7 个值。
+```c
+EIP = 0x1C  // 取走了位于栈顶 0x1C 位置处的 EIP 的值。
+_sys_execve:
+    lea EIP(%esp),%eax
+    pushl %eax
+    call _do_execve
+    addl $4,%esp
+    ret
+
+int do_execve(
+        unsigned long * eip,
+        long tmp,
+		// 通过 C 语言函数调用的约定，取走了 filename，argv，envp 等参数。
+        char * filename,
+        char ** argv,
+        char ** envp) {
+    ...
+}
+```
+
+## fork中进程基本信息的复制
+```c
+// git/Linux-0.11code/kernel/system_call.s
+_sys_fork:
+    call _find_empty_process    	// find_empty_process，就是找到空闲的进程槽位。
+    testl %eax,%eax
+    js 1f
+    push %gs
+    pushl %esi
+    pushl %edi
+    pushl %ebp
+    pushl %eax
+    call _copy_process				// copy_process，就是复制进程。
+    addl $20,%esp
+1:  ret
+```
+> 这个方法的意思非常简单，因为存储进程的数据结构是一个 task[64] 数组，这个是在之前 第18回 | 大名鼎鼎的进程调度就是从这里开始的 sched_init 函数的时候设置的。就是先在这个数组中找一个空闲的位置，准备存一个新的进程的结构 task_struct，这个结构之前在 一个新进程的诞生（三）如果让你来设计进程调度 也简单说过了。
+> 这个结构各个字段具体赋什么值呢？通过 copy_process 这个名字我们知道，就是复制原来的进程，也就是当前进程。当前只有一个进程，就是数组中位置 0 处的 init_task.init，也就是零号进程，那自然就复制它咯。
+
+```c
+// git/Linux-0.11/kernel/fork.c
+long last_pid = 0;
+
+int find_empty_process(void) {
+    int i;
+    repeat:
+        if ((++last_pid)<0) last_pid=1;	 	// 判断 ++last_pid 是不是小于零了，小于零说明已经超过 long 的最大值了，重新赋值为 1，起到一个保护作用，这没什么好说的。
+        for(i=0 ; i<64 ; i++)				// 一个 for 循环，看看刚刚的 last_pid 在所有 task[] 数组中，是否已经被某进程占用了。如果被占用了，那就重复执行，再次加一，然后再次判断，直到找到一个 pid 号没有被任何进程用为止。
+            if (task[i] && task[i]->pid == last_pid) goto repeat;
+    for(i=1 ; i<64; i++)					// 又是个 for 循环，刚刚已经找到一个可用的 pid 号了，那这一步就是再次遍历这个 task[] 试图找到一个空闲项，找到了就返回素组索引下标。
+        if (!task[i])
+            return i;						// 最终，这个方法就返回 task[] 数组的索引，表示找到了一个空闲项，之后就开始往这里塞一个新的进程吧。
+    return -EAGAIN;
+}
+```
+> 由于我们现在只有 0 号进程，且 task[] 除了 0 号索引位置，其他地方都是空的，所以这个方法运行完，last_pid 就是 1，也就是新进程被分配的 pid 就是 1，然后即将要加入的 task[] 数组的索引位置，也是 1。
+```c
+// git/Linux-0.11code/kernel/fork.c
+/*
+ *  Ok, this is the main fork-routine. It copies the system process
+ * information (task[nr]) and sets up the necessary registers. It
+ * also copies the data segment in it's entirety.
+ */
+int copy_process(int nr,long ebp,long edi,long esi,long gs,long none,
+        long ebx,long ecx,long edx,
+        long fs,long es,long ds,
+        long eip,long cs,long eflags,long esp,long ss)
+{
+    struct task_struct *p;
+    int i;
+    struct file *f;
+
+
+    p = (struct task_struct *) get_free_page();  	// 首先 get_free_page 会在主内存末端申请一个空闲页面，还记得我们之前在 第13回 内存初始化 mem_init 里是怎么管理内存的吧？那 get_free_page 这个函数就很简单了，就是遍历 mem_map[] 这个数组，找出值为零的项，就表示找到了空闲的一页内存。然后把该项置为 1，表示该页已经被使用。最后，算出这个页的内存起始地址，返回。拿到的这个内存起始地址，就给了 task_struct 结构的 p。
+    if (!p)
+        return -EAGAIN;
+    task[nr] = p;						// 将这个 p 记录在进程管理结构 task[] 中。
+    *p = *current;  /* NOTE! this doesn't copy the supervisor stack */
+	// 进程 1 和进程 0 目前是完全复制的关系，但有一些值是需要个性化处理的，下面的代码就是把这些不一样的值覆盖掉。不一样的值，一部分是 state，pid，counter 这种进程的元信息，另一部分是 tss 里面保存的各种寄存器的信息，即上下文。这里有两个寄存器的值的赋值有些特殊，就是 ss0 和 esp0，这个表示 0 特权级也就是内核态时的 ss:esp 的指向。
+    p->state = TASK_UNINTERRUPTIBLE;  	// 把进程 1 的状态先设置为 TASK_UNINTERRUPTIBLE，使得其不会被进程调度算法选中。
+    p->pid = last_pid;
+    p->father = current->pid;
+    p->counter = p->priority;
+    p->signal = 0;
+    p->alarm = 0;
+    p->leader = 0;      /* process leadership doesn't inherit */
+    p->utime = p->stime = 0;
+    p->cutime = p->cstime = 0;
+    p->start_time = jiffies;
+    p->tss.back_link = 0;
+    p->tss.esp0 = PAGE_SIZE + (long) p;
+    p->tss.ss0 = 0x10;
+    p->tss.eip = eip;
+    p->tss.eflags = eflags;
+    p->tss.eax = 0;
+    p->tss.ecx = ecx;
+    p->tss.edx = edx;
+    p->tss.ebx = ebx;
+    p->tss.esp = esp;
+    p->tss.ebp = ebp;
+    p->tss.esi = esi;
+    p->tss.edi = edi;
+    p->tss.es = es & 0xffff;
+    p->tss.cs = cs & 0xffff;
+    p->tss.ss = ss & 0xffff;
+    p->tss.ds = ds & 0xffff;
+    p->tss.fs = fs & 0xffff;
+    p->tss.gs = gs & 0xffff;
+    p->tss.ldt = _LDT(nr);
+    p->tss.trace_bitmap = 0x80000000;
+    if (last_task_used_math == current)
+        __asm__("clts ; fnsave %0"::"m" (p->tss.i387));
+    if (copy_mem(nr,p)) {
+        task[nr] = NULL;
+        free_page((long) p);
+        return -EAGAIN;
+    }
+    for (i=0; i<NR_OPEN;i++)
+        if (f=p->filp[i])
+            f->f_count++;
+    if (current->pwd)
+        current->pwd->i_count++;
+    if (current->root)
+        current->root->i_count++;
+    if (current->executable)
+        current->executable->i_count++;
+    set_tss_desc(gdt+(nr<<1)+FIRST_TSS_ENTRY,&(p->tss));
+    set_ldt_desc(gdt+(nr<<1)+FIRST_LDT_ENTRY,&(p->ldt));
+    p->state = TASK_RUNNING;    /* do this last, just in case 而所有复制工作完成后，进程 1 就拥有了运行的内容，进程基本信息也有了，进程的内存规划也完成了。此时就把进程设置为 TASK_RUNNING，允许被 CPU 调度。*/
+    return last_pid;
+}
+```
+> 根据代码我们得知，其含义是将代码在内核态时使用的堆栈栈顶指针指向进程 task_struct 所在的 4K 内存页的最顶端，而且之后的每个进程都是这样被设置的。
+> 就是内存中找个地方存一个 task_struct 结构的东东，并添加到 task[] 数组里的空闲位置处，这个东东的具体字段赋值的大部分都是复制原来进程的。
+
+## 透过fork来看进程的内存规划
+> 首先来看fork的剩下部分，copy_mem
+```c
+// git/Linux-0.11code/kernel/fork.c
+int copy_mem(int nr,struct task_struct * p)
+{
+	// 局部描述符表 LDT 赋值
+	unsigned long old_data_base,new_data_base,data_limit;
+	unsigned long old_code_base,new_code_base,code_limit;
+	// 其中段限长，就是取自进程 0 设置好的段限长，也就是 640K。
+	code_limit=get_limit(0x0f);
+	data_limit=get_limit(0x17);
+	// 拷贝页表
+	old_code_base = get_base(current->ldt[1]);
+	old_data_base = get_base(current->ldt[2]);
+	if (old_data_base != old_code_base)
+		panic("We don't support separate I&D");
+	if (data_limit < code_limit)
+		panic("Bad data_limit");
+	new_data_base = new_code_base = nr * 0x4000000;   // 而段基址有点意思，是取决于当前是几号进程，也就是 nr 的值。这里的 0x4000000 等于 64M。也就是说，今后每个进程通过段基址的手段，分别在线性地址空间中占用 64M 的空间（暂不考虑段限长），且紧挨着。
+	p->start_code = new_code_base;
+	set_base(p->ldt[1],new_code_base);
+	set_base(p->ldt[2],new_data_base);
+	if (copy_page_tables(old_data_base,new_data_base,data_limit)) {
+		free_page_tables(new_data_base,data_limit);
+		return -ENOMEM;
+	}
+	return 0;
+}
+```
+> 其实就是新进程 LDT 表项的赋值，以及页表的拷贝。
+> 我们给进程 0 准备的 LDT 的代码段和数据段，段基址都是 0，段限长是 640K。给进程 1，也就是我们现在正在 fork 的这个进程，其代码段和数据段还没有设置。所以第一步，局部描述符表 LDT 的赋值。其中段限长，就是取自进程 0 设置好的段限长，也就是 640K。
+> 上面刚刚讲完段表的赋值，接下来就是页表的复制了。
+```c
+// git/Linux-0.11code/mm/memory.c
+/*
+ *  Well, here is one of the most complicated functions in mm. It
+ * copies a range of linerar addresses by copying only the pages.
+ * Let's hope this is bug-free, 'cause this one I don't want to debug :-)
+ *
+ * Note! We don't copy just any chunks of memory - addresses have to
+ * be divisible by 4Mb (one page-directory entry), as this makes the
+ * function easier. It's used only by fork anyway.
+ *
+ * NOTE 2!! When from==0 we are copying kernel space for the first
+ * fork(). Then we DONT want to copy a full page-directory entry, as
+ * that would lead to some serious memory waste - we just copy the
+ * first 160 pages - 640kB. Even that is more than we need, but it
+ * doesn't take any more memory - we don't copy-on-write in the low
+ * 1 Mb-range, so the pages can be shared with the kernel. Thus the
+ * special case for nr=xxxx.
+ */
+int copy_page_tables(unsigned long from,unsigned long to,long size)
+{
+	unsigned long * from_page_table;
+	unsigned long * to_page_table;
+	unsigned long this_page;
+	unsigned long * from_dir, * to_dir;
+	unsigned long nr;
+
+	if ((from&0x3fffff) || (to&0x3fffff))
+		panic("copy_page_tables called with wrong alignment");
+	from_dir = (unsigned long *) ((from>>20) & 0xffc); /* _pg_dir = 0 */
+	to_dir = (unsigned long *) ((to>>20) & 0xffc);
+	size = ((unsigned) (size+0x3fffff)) >> 22;
+	for( ; size-->0 ; from_dir++,to_dir++) {
+		if (1 & *to_dir)
+			panic("copy_page_tables: already exist");
+		if (!(1 & *from_dir))
+			continue;
+		from_page_table = (unsigned long *) (0xfffff000 & *from_dir);
+		if (!(to_page_table = (unsigned long *) get_free_page()))
+			return -1;	/* Out of memory, see freeing */
+		*to_dir = ((unsigned long) to_page_table) | 7;
+		nr = (from==0)?0xA0:1024;
+		for ( ; nr-- > 0 ; from_page_table++,to_page_table++) {
+			this_page = *from_page_table;
+			if (!(1 & this_page))
+				continue;
+			this_page &= ~2;		// ~2 表示取反，2 用二进制表示是 10，取反就是 01，其目的是把 this_page 也就是当前的页表的 RW 位置零，也就是是把该页变成只读。
+			*to_page_table = this_page;	//  表示又把源页表也变成只读。也就是说，经过 fork 创建出的新进程，其页表项都是只读的，而且导致源进程的页表项也变成了只读。这个就是写时复制的基础，新老进程一开始共享同一个物理内存空间，如果只有读，那就相安无事，但如果任何一方有写操作，由于页面是只读的，将触发缺页中断，然后就会分配一块新的物理内存给产生写操作的那个进程，此时这一块内存就不再共享了。
+			if (this_page > LOW_MEM) {
+				*from_page_table = this_page;
+				this_page -= LOW_MEM;
+				this_page >>= 12;
+				mem_map[this_page]++;
+			}
+		}
+	}
+	invalidate();
+	return 0;
+}
+```
+> 这个函数要完成什么事情呢？你想，现在进程 0 的线性地址空间是 0 - 64M，进程 1 的线性地址空间是 64M - 128M。我们现在要造一个进程 1 的页表，使得进程 1 和进程 0 最终被映射到的物理空间都是 0 - 64M，这样进程 1 才能顺利运行起来，不然就乱套了。
+
+## 一个新进程的诞生
+- 进程调度机制
+  - 进程调度的始作俑者，就是那个每 10ms 触发一次的定时器滴答。而这个滴答将会给 CPU 产生一个时钟中断信号。而这个中断信号会使 CPU 查找中断向量表，找到操作系统写好的一个时钟中断处理函数 do_timer。
+  - do_timer 会首先将当前进程的 counter 变量 -1，如果 counter 此时仍然大于 0，则就此结束。但如果 counter = 0 了，就开始进行进程的调度。
+  - 进程调度就是找到所有处于 RUNNABLE 状态的进程，并找到一个 counter 值最大的进程，把它丢进 switch_to 函数的入参里。
+  - switch_to 这个终极函数，会保存当前进程上下文，恢复要跳转到的这个进程的上下文，同时使得 CPU 跳转到这个进程的偏移地址处。
+  - 这个进程就舒舒服服地运行了起来，等待着下一次时钟中断的来临。
+- fork函数
+  - copy_process 是复制进程的关键
+  - 第一，原封不动复制了一下 task_struct。并且覆盖了一些基本信息，包括元信息和一些寄存器的信息。其中比较重要的是将内核态堆栈栈顶指针的指向了自己进程结构所在 4K 内存页的最顶端。
+  - 第二，LDT 的复制和改造，使得进程 0 和进程 1 分别映射到了不同的线性地址空间。
+  - 第三，页表的复制，使得进程 0 和进程 1 又从不同的线性地址空间，被映射到了相同的物理地址空间。
+  - 最后，将新老进程的页表都变成只读状态，为后面写时复制的缺页中断做准备。
+  - 到这里进程 1 的初步建立工作已经圆满结束，可以达到运行在 CPU 上的标准了。
+
+## 写时复制
+**背景知识**
+- 分段分页
+- **写时复制的本质**
+> 在调用 fork() 生成新进程时，新进程与原进程会共享同一内存区。只有当其中一个进程进行写操作时，系统才会为其另外分配内存页面。
+> 进程通过自己的页表占用了一定范围的物理内存空间。调用 fork 创建新进程时，原本页表和物理地址空间里的内容，都要进行复制，因为进程的内存空间是要隔离的嘛。但 fork 函数认为，复制物理地址空间里的内容，比较费时，所以姑且先只复制页表，物理地址空间的内容先不复制。如果只有读操作，那就完全没有影响，复不复制物理地址空间里的内容就无所谓了，这就很赚。但如果有写操作，那就不得不把物理地址空间里的值复制一份，保证进程间的内存隔离。有写操作时，再复制物理内存，就叫写时复制。
+> 有上述的现象，必然是在 fork 时，对页表做了手脚，这回知道为啥储备知识里讲页表结构了吧？同时，只要有写操作，就会触发写时复制这个逻辑，这是咋做到的呢？答案是通过中断，具体是缺页中断。
+```c
+int copy_page_tables(...) {
+    ...
+    // 源页表和新页表一样
+    this_page = *from_page_table;
+    ...
+    // 源页表和新页表均置为只读
+    this_page &= ~2;
+    *from_page_table = this_page;
+    ...
+}
+```
+> Linux 0.11 的缺页中断处理函数的开头是用汇编写的，看着太闹心了，这里我选 Linux 1.0 的代码给大家看，逻辑是一样的。
+```c
+void do_page_fault(..., unsigned long error_code) {
+    ...   
+    if (error_code & 1)	// 当 error_code 的第 0 位，也就是存在位为 0 时，会走 do_no_page 逻辑，其余情况，均走 do_wp_page 逻辑。
+        do_wp_page(error_code, address, current, user_esp);	// 我们 fork 的时候只是将读写位变成了只读，存在位仍然是 1 没有动，所以会走 do_wp_page 逻辑。
+    else
+        do_no_page(error_code, address, current, user_esp);
+    ...
+}
+
+void do_wp_page(unsigned long error_code,unsigned long address) {
+    // 后面这一大坨计算了 address 在页表项的指针
+    un_wp_page((unsigned long *)
+        (((address>>10) & 0xffc) + (0xfffff000 &
+        *((unsigned long *) ((address>>20) &0xffc)))));
+}
+
+void un_wp_page(unsigned long * table_entry) {
+    unsigned long old_page,new_page;
+    old_page = 0xfffff000 & *table_entry;
+    // 只被引用一次，说明没有被共享，那只改下读写属性就行了
+    if (mem_map[MAP_NR(old_page)]==1) {
+        *table_entry |= 2;
+        invalidate();
+        return;
+    }
+    // 被引用多次，就需要复制页表了
+
+    new_page=get_free_page()；
+    mem_map[MAP_NR(old_page)]--;
+    *table_entry = new_page | 7;
+    invalidate();
+    copy_page(old_page,new_page);
+}
+
+// 刷新页变换高速缓冲宏函数
+#define invalidate() \
+__asm__("movl %%eax,%%cr3"::"a" (0))
+```
+
+## 拿到硬盘信息
+> 由于 fork 函数一调用，就又多出了一个进程，子进程（进程 1）会返回 0，父进程（进程 0）返回子进程的 ID，所以 init 函数只有进程 1 才会执行。第三部分结束后，就到了现在的第四部分，shell 程序的到来。而整个第四部分的故事，就是这个 init 函数做的事情。
+```c
+struct drive_info { char dummy[32]; } drive_info;
+
+void init(void)
+{
+	int pid,i;
+
+	setup((void *) &drive_info);
+	(void) open("/dev/tty0",O_RDWR,0);
+	(void) dup(0);
+	(void) dup(0);
+	printf("%d buffers = %d bytes buffer space\n\r",NR_BUFFERS,
+		NR_BUFFERS*BLOCK_SIZE);
+	printf("Free mem: %d bytes\n\r",memory_end-main_memory_start);
+	if (!(pid=fork())) {
+		close(0);
+		if (open("/etc/rc",O_RDONLY,0))
+			_exit(1);
+		execve("/bin/sh",argv_rc,envp_rc);
+		_exit(2);
+	}
+	if (pid>0)
+		while (pid != wait(&i))
+			/* nothing */;
+	while (1) {
+		if ((pid=fork())<0) {
+			printf("Fork failed in init\r\n");
+			continue;
+		}
+		if (!pid) {
+			close(0);close(1);close(2);
+			setsid();
+			(void) open("/dev/tty0",O_RDWR,0);
+			(void) dup(0);
+			(void) dup(0);
+			_exit(execve("/bin/sh",argv,envp));
+		}
+		while (1)
+			if (pid == wait(&i))
+				break;
+		printf("\n\rchild %d died with code %04x\n\r",pid,i);
+		sync();
+	}
+	_exit(0);	/* NOTE! _exit, not exit() */
+}
+```
+> setup((void *) &drive_info)  获取硬盘信息
+> drive_info 是来自内存 0x90080 的数据，这部分是由之前 第5回 | 进入保护模式前的最后一次折腾内存 讲的 setup.s 程序将硬盘 1 的参数信息放在这里了，包括柱面数、磁头数、扇区数等信息。
+> setup 是个系统调用，会通过中断最终调用到 sys_setup 函数。关于系统调用的原理，在 第25回 | 通过 fork 看一次系统调用 中已经讲得很清楚了，此处不再赘述。
+```c
+static struct hd_struct {
+    long start_sect;
+    long nr_sects;
+} hd[5] = {}
+
+int sys_setup(void * BIOS) {
+	// 硬盘基本信息的赋值的操作
+    hd_info[0].cyl = *(unsigned short *) BIOS;
+    hd_info[0].head = *(unsigned char *) (2+BIOS);
+    hd_info[0].wpcom = *(unsigned short *) (5+BIOS);
+    hd_info[0].ctl = *(unsigned char *) (8+BIOS);
+    hd_info[0].lzone = *(unsigned short *) (12+BIOS);
+    hd_info[0].sect = *(unsigned char *) (14+BIOS);
+    BIOS += 16;
+	// 硬盘分区表的设置
+    hd[0].start_sect = 0;
+    hd[0].nr_sects = 
+        hd_info[0].head * hd_info[0].sect * hd_info[0].cyl;
+    
+    struct buffer_head *bh = bread(0x300, 0);
+    struct partition *p = 0x1BE + (void *)bh->b_data; //第一个参数 0x300 是第一块硬盘的主设备号，就表示要读取的块设备是硬盘一。第二个参数 0 表示读取第一个块，一个块为 1024 字节大小，也就是连续读取硬盘开始处 0 ~ 1024 字节的数据。拿到这部分数据后，再取 0x1BE 偏移处，就得到了分区信息。
+    for (int i=1;i<5;i++,p++) {	// 给 hd 数组的五项附上了值。这表示硬盘的分区信息，每个分区用 start_sect 和 nr_sects，也就是开始扇区和总扇区数来记录。这些信息是从哪里获取的呢？就是在硬盘的第一个扇区的 0x1BE 偏移处，这里存储着该硬盘的分区信息，只要把这个地方的数据拿到就 OK 了。所以 bread 就是干这事的，从硬盘读取数据。
+        hd[i].start_sect = p->start_sect;
+        hd[i].nr_sects = p->nr_sects;
+    }
+    brelse(bh);
+    
+    rd_load();		// rd_load 是当有 ramdisk 时，也就是虚拟内存盘，才会执行。
+    mount_root();	// mount_root 直译过来就是加载根，再多说几个字是加载根文件系统，有了它之后，操作系统才能从一个根开始找到所有存储在硬盘中的文件，所以它是文件系统的基石，很重要。为了加载根文件系统，或者说所谓的加载根文件系统，就是把硬盘中的数据加载到内存里，以文件系统的数据格式来解读这些信息。所以第一，需要硬盘本身就有文件系统的信息，硬盘不能是裸盘，这个不归操作系统管，你为了启动我的 Linux 0.11，必须拿来一块做好了文件系统的硬盘来。第二，需要读取硬盘的数据到内存，那就必须需要知道硬盘的参数信息，这就是我们本讲所做的事情的意义。
+    return (0);
+}
+
+struct hd_i_struct {
+    // 磁头数、每磁道扇区数、柱面数、写前预补偿柱面号、磁头着陆区柱面号、控制字节
+    int head,sect,cyl,wpcom,lzone,ctl;
+};
+struct hd_i_struct hd_info[] = {}；
+```
+
+## 加载根文件系统
