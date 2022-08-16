@@ -2687,6 +2687,7 @@ __asm__("movl %%eax,%%cr3"::"a" (0))
 ## 拿到硬盘信息
 > 由于 fork 函数一调用，就又多出了一个进程，子进程（进程 1）会返回 0，父进程（进程 0）返回子进程的 ID，所以 init 函数只有进程 1 才会执行。第三部分结束后，就到了现在的第四部分，shell 程序的到来。而整个第四部分的故事，就是这个 init 函数做的事情。
 ```c
+// git/Linux-0.11code/init/main.c
 struct drive_info { char dummy[32]; } drive_info;
 
 void init(void)
@@ -2736,6 +2737,7 @@ void init(void)
 > drive_info 是来自内存 0x90080 的数据，这部分是由之前 第5回 | 进入保护模式前的最后一次折腾内存 讲的 setup.s 程序将硬盘 1 的参数信息放在这里了，包括柱面数、磁头数、扇区数等信息。
 > setup 是个系统调用，会通过中断最终调用到 sys_setup 函数。关于系统调用的原理，在 第25回 | 通过 fork 看一次系统调用 中已经讲得很清楚了，此处不再赘述。
 ```c
+// git/linux-0.11/kernel/blk_drv/hd.c
 static struct hd_struct {
     long start_sect;
     long nr_sects;
@@ -2776,3 +2778,754 @@ struct hd_i_struct hd_info[] = {}；
 ```
 
 ## 加载根文件系统
+> 首先看一下setup 方法中的最后一个函数 mount_root。
+```c
+int sys_setup(void * BIOS) {	// setup 的主要工作就是我们今天所讲的，加载根文件系统。
+    ...
+    mount_root();
+}
+
+// git/Linux-0.11code/fs/super.c
+
+struct file {
+    unsigned short f_mode;
+    unsigned short f_flags;
+    unsigned short f_count;
+    struct m_inode * f_inode;
+    off_t f_pos;
+};
+
+void mount_root(void) {
+    int i,free;
+    struct super_block * p;
+    struct m_inode * mi;
+
+    for(i=0;i<64;i++)
+        file_table[i].f_count=0;	// 这个 file_table 表示进程所使用的文件，进程每使用一个文件，都需要记录在这里，包括文件类型、文件 inode 索引信息等，而这个 f_count 表示被引用的次数，此时还没有引用，所以设置为零。  struct file file_table[NR_FILE];
+
+    for(p = &super_block[0] ; p < &super_block[8] ; p++) {	// 把一个数组 super_block 做清零工作。这个 super_block 存在的意义是，操作系统与一个设备以文件形式进行读写访问时，就需要把这个设备的超级块信息放在这里。
+        p->s_dev = 0;
+        p->s_lock = 0;
+        p->s_wait = NULL;
+    }
+    p=read_super(0);	// 读取硬盘的超级块信息到内存中来。
+    mi=iget(0,1);		// 读取根 inode 信息。
+
+    mi->i_count += 3 ;
+    p->s_isup = p->s_imount = mi;
+    current->pwd = mi;		// 把该 inode 设置为当前进程（也就是进程 1）的当前工作目录和根目录。
+    current->root = mi;
+    free=0;
+    i=p->s_nzones;		// 记录 inode 位图信息。
+    while (-- i >= 0)
+        if (!set_bit(i&8191,p->s_zmap[i>>13]->b_data))
+            free++;
+
+    free=0;
+    i=p->s_ninodes+1;	// 记录 inode 位图信息。
+    while (-- i >= 0)
+        if (!set_bit(i&8191,p->s_imap[i>>13]->b_data))
+            free++;
+}
+```
+> 从整体上说，它就是要把硬盘中的数据，以文件系统的格式进行解读，加载到内存中设计好的数据结构，这样操作系统就可以通过内存中的数据，以文件系统的方式访问硬盘中的一个个文件了。
+> 那其实搞清楚两个事情即可：第一，硬盘中的文件系统格式是怎样的？第二，内存中用于文件系统的数据结构有哪些？
+> Linux-0.11 中的文件系统是 MINIX 文件系统。该文件系统的结构如下：
+> 引导块-超级快-inode位图-块位图-i节点...-块...
+> 引导块就是我们系列最开头说的启动区，当然不一定所有的硬盘都有启动区，但我们还是得预留出这个位置，以保持格式的统一。
+> 超级块用于描述整个文件系统的整体信息，我们看它的字段就知道了，有后面的 inode 数量，块数量，第一个块在哪里等信息。有了它，整个硬盘的布局就清晰了。
+> inode 位图和块位图，就是位图的基本操作和作用了，表示后面 inode 和块的使用情况，和我们之前讲的内存占用位图 mem_map[] 是类似的。
+> inode 存放着每个文件或目录的元信息和索引信息，元信息就是文件类型、文件大小、修改时间等，索引信息就是大小为 9 的 i_zone[9] 块数组，表示这个文件或目录的具体数据占用了哪些块。
+> 其中块数组里，0~6 表示直接索引，7 表示一次间接索引，8 表示二次间接索引。当文件比较小时，比如只占用 2 个块就够了，那就只需要 zone[0] 和 zone[1] 两个直接索引即可。
+> 存放具体文件或目录实际信息的块。如果是一个普通文件类型的 inode 指向的块，那里面就直接是文件的二进制信息。如果是一个目录类型的 inode 指向的块，那里面存放的就是这个目录下的文件和目录的 inode 索引以及文件或目录名称等信息。
+
+**继续看init**
+```c
+void init(void) {
+    setup((void *) &drive_info);
+    (void) open("/dev/tty0",O_RDWR,0);	// open 了一个 /dev/tty0 的文件 
+    (void) dup(0);
+    (void) dup(0);
+}
+```
+> 之前 setup 函数的一番折腾，加载了根文件系统，顺着根 inode 可以找到所有文件，就是为了下一行 open 函数可以通过文件路径，从硬盘中把一个文件的信息方便地拿到。
+
+## 打开终端设备文件
+```c
+void init(void) {
+    setup((void *) &drive_info);
+    (void) open("/dev/tty0",O_RDWR,0);	// open 了一个 /dev/tty0 的文件 
+    (void) dup(0);
+    (void) dup(0);
+}
+```
+> open 函数会触发 0x80 中断，最终调用到 sys_open 这个系统调用函数
+```c
+// git/Linux-0.11code/lib/open.c
+int open(const char * filename, int flag, ...)
+{
+	register int res;
+	va_list arg;
+
+	va_start(arg,flag);
+	__asm__("int $0x80"
+		:"=a" (res)
+		:"0" (__NR_open),"b" (filename),"c" (flag),
+		"d" (va_arg(arg,int)));
+	if (res>=0)
+		return res;
+	errno = -res;
+	return -1;
+}
+
+// git/Linux-0.11code/fs/open.c
+int sys_open(const char * filename,int flag,int mode)
+{
+	struct m_inode * inode;
+	struct file * f;
+	int i,fd;
+
+	mode &= 0777 & ~current->umask;
+	for(fd=0 ; fd<NR_OPEN ; fd++)	// 第一步，在进程文件描述符数组 filp 中找到一个空闲项。还记得进程的 task_struct 结构吧，其中有一个 filp 数组的字段，就是我们常说的文件描述符数组，这里先找到一个空闲项，将空闲地方的索引值即为 fd。由于此时当前进程，也就是进程 1，还没有打开过任何文件，所以 0 号索引处就是空闲的，fd 自然就等于 0。
+		if (!current->filp[fd])
+			break;
+	if (fd>=NR_OPEN)
+		return -EINVAL;
+	current->close_on_exec &= ~(1<<fd);
+	f=0+file_table;
+	for (i=0 ; i<NR_FILE ; i++,f++)	// 第二步，在系统文件表 file_table 中找到一个空闲项。
+		if (!f->f_count) break;
+	if (i>=NR_FILE)
+		return -EINVAL;
+	(current->filp[fd]=f)->f_count++;	// 第三步，将进程的文件描述符数组项和系统的文件表项，对应起来。
+	if ((i=open_namei(filename,flag,mode,&inode))<0) {	// 第四步，根据文件名从文件系统中找到这个文件。其实相当于找到了这个 tty0 文件对应的 inode 信息。
+		current->filp[fd]=NULL;
+		f->f_count=0;
+		return i;
+	}
+	// 接下来判断 tty0 这个 inode 是否是字符设备，如果是字符设备文件，那么如果设备号是 4 的话，则设置当前进程的 tty 号为该 inode 的子设备号。并设置当前进程tty 对应的tty 表项的父进程组号等于进程的父进程组号。
+/* ttys are somewhat special (ttyxx major==4, tty major==5) */
+	if (S_ISCHR(inode->i_mode))
+		if (MAJOR(inode->i_zone[0])==4) {
+			if (current->leader && current->tty<0) {
+				current->tty = MINOR(inode->i_zone[0]);
+				tty_table[current->tty].pgrp = current->pgrp;
+			}
+		} else if (MAJOR(inode->i_zone[0])==5)
+			if (current->tty<0) {
+				iput(inode);
+				current->filp[fd]=NULL;
+				f->f_count=0;
+				return -EPERM;
+			}
+/* Likewise with block-devices: check for floppy_change */
+	if (S_ISBLK(inode->i_mode))
+		check_disk_change(inode->i_zone[0]);
+	// 第五步，填充 file 数据。其实就是初始化这个 f，包括刚刚找到的 inode 值。最后返回给上层文件描述符 fd 的值，也就是零。
+	f->f_mode = inode->i_mode;
+	f->f_flags = flag;
+	f->f_count = 1;
+	f->f_inode = inode;
+	f->f_pos = 0;
+	return (fd);
+}
+```
+> 其实打开一个文件，即刚刚的 open 函数，就是在上述操作后，返回一个 int 型的数值 fd，称作文件描述符。之后我们就可以对着这个文件描述符进行读写。之所以可以这么方便，是由于通过这个文件描述符，最终能够找到其对应文件的 inode 信息，有了这个信息，就能够找到它在磁盘文件中的位置（当然文件还分为常规文件、目录文件、字符设备文件、块设备文件、FIFO 特殊文件等，这个之后再说），进行读写。
+> open 函数返回的为 0 号 fd，这个作为标准输入设备。
+> 接下来的 dup 为 1 号 fd 赋值，这个作为标准输出设备。
+> 再接下来的 dup 为 2 号 fd 赋值，这个作为标准错误输出设备。
+> 那这个 dup 又是什么原理呢？非常简单，首先仍然是通过系统调用方式，调用到 sys_dup 函数。
+**看看dup函數**
+```c
+// git/Linux-0.11code/include/unistd.h
+#define __NR_dup	41
+int dup(int fildes);
+
+// git/Linux-0.11code/fs/fcntl.c
+int sys_dup(unsigned int fildes)
+{
+	return dupfd(fildes,0);
+}
+
+static int dupfd(unsigned int fd, unsigned int arg)
+{
+	if (fd >= NR_OPEN || !current->filp[fd])
+		return -EBADF;
+	if (arg >= NR_OPEN)
+		return -EINVAL;
+	while (arg < NR_OPEN)
+		if (current->filp[arg])
+			arg++;
+		else
+			break;
+	if (arg >= NR_OPEN)
+		return -EMFILE;
+	current->close_on_exec &= ~(1<<arg);
+	(current->filp[arg] = current->filp[fd])->f_count++;
+	return arg;
+}
+```
+> 这个函数的逻辑非常单纯，就是从进程的 filp 中找到下一个空闲项，然后把要复制的文件描述符 fd 的信息，统统复制到这里。
+> 那根据上下文，这一步其实就是把 0 号文件描述符，复制到 1 号文件描述符，那么 0 号和 1 号文件描述符，就统统可以通过一条路子，找到最终 tty0 这个设备文件的 inode 信息了。
+> 进程 1 的 init 函数的前四行就讲完了，此时进程 1 已经比进程 0 多了与 外设交互的能力，具体说来是 tty0 这个外设（也是个文件，因为 Linux 下一切皆文件）交互的能力，这句话怎么理解呢？什么叫多了这个能力？
+> 因为进程 fork 出自己子进程的时候，这个 filp 数组也会被复制，那么当进程 1 fork 出进程 2 时，进程 2 也会拥有这样的映射关系，也可以操作 tty0 这个设备，这就是“能力”二字的体现。
+> 而进程 0 是不具备与外设交互的能力的，因为它并没有打开任何的文件，filp 数组也就没有任何作用。
+> 进程 1 刚刚创建的时候，是 fork 的进程 0，所以也不具备这样的能力，而通过 setup 加载根文件系统，open 打开 tty0 设备文件等代码，使得进程 1 具备了与外设交互的能力，同时也使得之后从进程 1 fork 出来的进程 2 也天生拥有和进程 1 同样的与外设交互的能力。
+```c
+void init(void) {
+    setup((void *) &drive_info);
+    (void) open("/dev/tty0",O_RDWR,0);
+    (void) dup(0);
+    (void) dup(0);
+    printf("%d buffers = %d bytes buffer space\n\r",NR_BUFFERS, \
+        NR_BUFFERS*BLOCK_SIZE);
+    printf("Free mem: %d bytes\n\r",memory_end-main_memory_start);
+}
+```
+> 接下来的两行是个打印语句，其实就是基于刚刚打开并创建的 0,1,2 三个文件描述符而做出的操作。
+> 刚刚也说了 1 号文件描述符被当做标准输出，那我们进入 printf 的实现看看有没有用到它。
+```c
+// git/Linux-0.11code/init/main.c
+static int printf(const char *fmt, ...)
+{
+	va_list args;
+	int i;
+
+	va_start(args, fmt);
+	write(1,printbuf,i=vsprintf(printbuf, fmt, args));	// 中间有个 write 函数，传入了 1 号文件描述符作为第一个参数。
+	va_end(args);
+	return i;
+}
+```
+
+## 进程2的创建
+```c
+void init(void) {
+    ...
+    if (!(pid=fork())) {
+        close(0);
+        open("/etc/rc",O_RDONLY,0);
+        execve("/bin/sh",argv_rc,envp_rc);
+        _exit(2);
+    }
+    ...
+}
+```
+1. fork 一个新的子进程，此时就是进程 2 了。
+   > 第一点，进程 1 打开了三个文件描述符并指向了 tty0，那这个也被复制到进程 2 了，具体说来就是进程结构 task_struct 里的 flip[] 数组被复制了一份。而进程 0 fork 出进程 1 时是没有复制这部分信息的，因为进程 0 没有打开任何文件。这也是刚刚说的与外设交互能力的体现，即进程 0 没有与外设交互的能力，进程 1 有，哎，其实就是这个 flip 数组里有没有东西而已嘛~
+   > 第二点，进程 0 复制进程 1 时页表的复制只有 160 项，也就是映射 640K，而之后进程的复制，统统都是复制 1024 项，也就是映射 4M 空间。
+	```c
+	int copy_page_tables(unsigned long from,unsigned long to,long size) {
+		...
+		nr = (from==0)?0xA0:1024;
+		...
+	}
+    ```
+2. 在进程 2 里关闭（close） 0 号文件描述符。也就是进程 1 复制过来的打开了 tty0 并作为标准输入的文件描述符，那么此时 0 号文件描述符就空出来了。
+    ```c
+	// git/Linux-0.11code/fs/open.c
+	int sys_close(unsigned int fd)
+	{	
+		struct file * filp;
+
+		if (fd >= NR_OPEN)
+			return -EINVAL;
+		current->close_on_exec &= ~(1<<fd);
+		if (!(filp = current->filp[fd]))
+			return -EINVAL;
+		current->filp[fd] = NULL;	// 把要关闭的文件描述符对应的filp这一项设为NULL
+		if (filp->f_count == 0)
+			panic("Close: file count is 0");
+		if (--filp->f_count)
+			return (0);
+		iput(filp->f_inode);
+		return (0);
+	}
+	```
+3. 只读形式打开（open） rc 文件。刚好占据了 0 号文件描述符的位置。这个 rc 文件表示配置文件，具体什么内容，取决于你的硬盘里这个位置处放了什么内容，与操作系统内核无关，所以我们暂且不用管。到目前为止，进程 2 与进程 1 的区别，仅仅是将 0 号文件描述符重新指向了 /etc/rc 文件，其他的没啥区别。
+4. 然后执行（execve） sh 程序。好，接下来进程 2 就将变得不一样了，会通过一个经典的，也是最难理解的 execve 函数调用，使自己摇身一变，成为 /bin/sh 程序继续运行
+
+## 扒开execve的皮
+> 进程 1 再次通过 fork 函数创建了进程 2，且进程 2 通过 close 和 open 函数，将 0 号文件描述符指向的标准输入 /dev/tty0 更换为指向 /etc/rc 文件。
+> 此时进程 2 和进程 1 几乎是完全一样的。接下来进程 2 就将变得不一样了，会通过一个经典的，也是最难理解的 execve 函数调用，使自己摇身一变，成为 /bin/sh 程序继续运行！
+```c
+static char * argv_rc[] = { "/bin/sh", NULL };
+static char * envp_rc[] = { "HOME=/", NULL };
+
+// 调用方
+execve("/bin/sh",argv_rc,envp_rc);
+
+// 宏定义
+_syscall3(int,execve,const char *,file,char **,argv,char **,envp)
+
+// 通过系统调用进入到这里 git/Linux-0.11code/kernel/system_call.s
+EIP = 0x1C
+_sys_execve:
+    lea EIP(%esp),%eax
+    pushl %eax
+    call _do_execve
+    addl $4,%esp
+    ret
+
+// 最终执行的函数  git/Linux-0.11code/fs/exec.c
+/*
+ * 'do_execve()' executes a new program.
+ */
+int do_execve(unsigned long * eip,long tmp,char * filename,
+	char ** argv, char ** envp)
+{
+	struct m_inode * inode; 	// 根据文件名 /bin/sh 获取 inode
+	struct buffer_head * bh;
+	struct exec ex;
+	unsigned long page[MAX_ARG_PAGES];
+	int i,argc,envc;
+	int e_uid, e_gid;
+	int retval;
+	int sh_bang = 0;
+	unsigned long p=PAGE_SIZE*MAX_ARG_PAGES-4;	// p = 4096 * 32 - 4 = 0x20000 - 4 = 128K - 4 为什么是这个数呢？整个这块讲完你就会知道，这表示参数表，每个进程的参数表大小为 128K，在每个进程地址空间的最末端。 参数表为 128K，就表示每个进程的线性地址空间的末端 128K，是为参数表保留的，目前这个 p 就指向了参数表的开始处（偏移 4 字节）。
+
+	if ((0xffff & eip[1]) != 0x000f)
+		panic("execve called from supervisor mode");
+	for (i=0 ; i<MAX_ARG_PAGES ; i++)	/* clear page-table */
+		page[i]=0;
+	if (!(inode=namei(filename)))		/* get executables inode */
+		return -ENOENT;
+	argc = count(argv);
+	envc = count(envp);
+	
+restart_interp:
+	if (!S_ISREG(inode->i_mode)) {	/* must be regular file */
+		retval = -EACCES;
+		goto exec_error2;
+	}
+	i = inode->i_mode;
+	e_uid = (i & S_ISUID) ? inode->i_uid : current->euid;
+	e_gid = (i & S_ISGID) ? inode->i_gid : current->egid;
+	if (current->euid == inode->i_uid)
+		i >>= 6;
+	else if (current->egid == inode->i_gid)
+		i >>= 3;
+	if (!(i & 1) &&
+	    !((inode->i_mode & 0111) && suser())) {
+		retval = -ENOEXEC;
+		goto exec_error2;
+	}
+	if (!(bh = bread(inode->i_dev,inode->i_zone[0]))) {	// 根据 inode 读取文件第一块数据（1024KB）
+		retval = -EACCES;
+		goto exec_error2;
+	}
+	// 解析这 1KB 的数据为 exec 结构  接下来的工作就是解析它，本质上就是按照指定的数据结构来解读罢了。
+	ex = *((struct exec *) bh->b_data);	/* read exec-header */
+	/*
+	struct exec {
+		// 魔数
+		unsigned long a_magic;
+		// 代码区长度
+		unsigned a_text;
+		// 数据区长度
+		unsigned a_data;
+		// 未初始化数据区长度
+		unsigned a_bss;
+		// 符号表长度
+		unsigned a_syms;
+		// 执行开始地址
+		unsigned a_entry;
+		// 代码重定位信息长度
+		unsigned a_trsize;
+		// 数据重定位信息长度
+		unsigned a_drsize;
+	};
+	// 上面的代码就是 exec 结构体，这是 a.out 格式文件的头部结构，现在的 Linux 已经弃用了这种古老的格式，改用 ELF 格式了，但大体的思想是一致的。
+	*/
+	if ((bh->b_data[0] == '#') && (bh->b_data[1] == '!') && (!sh_bang)) {	// 判断是脚本文件还是可执行文件 可以看到，很简单粗暴地判断前面两个字符是不是 #!，如果是的话，就走脚本文件的执行逻辑。我们现在的 /bin/sh 是个可执行的二进制文件，不符合这样的条件，所以这个 if 语句里面的内容我们也可以不看了，直接看外面，执行可执行二进制文件的逻辑。
+		/*
+		 * This section does the #! interpretation.
+		 * Sorta complicated, but hopefully it will work.  -TYT
+		 */
+
+		char buf[1023], *cp, *interp, *i_name, *i_arg;
+		unsigned long old_fs;
+
+		strncpy(buf, bh->b_data+2, 1022);
+		brelse(bh);
+		iput(inode);
+		buf[1022] = '\0';
+		if (cp = strchr(buf, '\n')) {
+			*cp = '\0';
+			for (cp = buf; (*cp == ' ') || (*cp == '\t'); cp++);
+		}
+		if (!cp || *cp == '\0') {
+			retval = -ENOEXEC; /* No interpreter name found */
+			goto exec_error1;
+		}
+		interp = i_name = cp;
+		i_arg = 0;
+		for ( ; *cp && (*cp != ' ') && (*cp != '\t'); cp++) {
+ 			if (*cp == '/')
+				i_name = cp+1;
+		}
+		if (*cp) {
+			*cp++ = '\0';
+			i_arg = cp;
+		}
+		/*
+		 * OK, we've parsed out the interpreter name and
+		 * (optional) argument.
+		 */
+		if (sh_bang++ == 0) {
+			p = copy_strings(envc, envp, page, p, 0);		// copy_strings 就是往这个参数表里面存放信息，不过具体存放的只是字符串常量值的信息，随后他们将被引用，有点像 Java 里 class 文件的字符串常量池思想。
+			p = copy_strings(--argc, argv+1, page, p, 0);
+		}
+		/*
+		 * Splice in (1) the interpreter's name for argv[0]
+		 *           (2) (optional) argument to interpreter
+		 *           (3) filename of shell script
+		 *
+		 * This is done in reverse order, because of how the
+		 * user environment and arguments are stored.
+		 */
+		p = copy_strings(1, &filename, page, p, 1);
+		argc++;
+		if (i_arg) {
+			p = copy_strings(1, &i_arg, page, p, 2);
+			argc++;
+		}
+		p = copy_strings(1, &i_name, page, p, 2);
+		argc++;
+		if (!p) {
+			retval = -ENOMEM;
+			goto exec_error1;
+		}
+		/*
+		 * OK, now restart the process with the interpreter's inode.
+		 */
+		old_fs = get_fs();
+		set_fs(get_ds());
+		if (!(inode=namei(interp))) { /* get executables inode */
+			set_fs(old_fs);
+			retval = -ENOENT;
+			goto exec_error1;
+		}
+		set_fs(old_fs);
+		goto restart_interp;
+	}
+	brelse(bh);		// brelse 释放这个缓冲块，因为已经把这个缓冲块内容解析成 exec 结构保存到我们程序的栈空间里了，那么这个缓冲块就可以释放，用于其他读取磁盘时的缓冲区。
+	if (N_MAGIC(ex) != ZMAGIC || ex.a_trsize || ex.a_drsize ||
+		ex.a_text+ex.a_data+ex.a_bss>0x3000000 ||
+		inode->i_size < ex.a_text+ex.a_data+ex.a_syms+N_TXTOFF(ex)) {
+		retval = -ENOEXEC;
+		goto exec_error2;
+	}
+	if (N_TXTOFF(ex) != BLOCK_SIZE) {
+		printk("%s: N_TXTOFF != BLOCK_SIZE. See a.out.h.", filename);
+		retval = -ENOEXEC;
+		goto exec_error2;
+	}
+	if (!sh_bang) {
+		p = copy_strings(envc,envp,page,p,0);		// copy_strings 就是往这个参数表里面存放信息，不过具体存放的只是字符串常量值的信息，随后他们将被引用，有点像 Java 里 class 文件的字符串常量池思想。envp 表示字符串参数 "HOME=/"，argv 表示字符串参数 "/bin/sh"，两个 copy 就表示把这个字符串参数往参数表里存，相应地指针 p 也往下移动（共移动了 7 + 8 = 15 个字节），和压栈的效果是一样的。
+		p = copy_strings(argc,argv,page,p,0);
+		if (!p) {
+			retval = -ENOMEM;
+			goto exec_error2;
+		}
+	}
+/* OK, This is the point of no return */
+	if (current->executable)
+		iput(current->executable);
+	current->executable = inode;
+	for (i=0 ; i<32 ; i++)
+		current->sigaction[i].sa_handler = NULL;
+	for (i=0 ; i<NR_OPEN ; i++)
+		if ((current->close_on_exec>>i)&1)
+			sys_close(i);
+	current->close_on_exec = 0;
+	free_page_tables(get_base(current->ldt[1]),get_limit(0x0f));
+	free_page_tables(get_base(current->ldt[2]),get_limit(0x17));
+	if (last_task_used_math == current)
+		last_task_used_math = NULL;
+	current->used_math = 0;
+	p += change_ldt(ex.a_text,page)-MAX_ARG_PAGES*PAGE_SIZE;  	// 更新局部描述符。根据 ex.a_text 修改局部描述符中的代码段限长 code_limit，其他没动。ex 结构里的 a_text 是生成 /bin/sh 这个 a.out 格式的文件时，写在头部的值，用来表示代码段的长度。至于具体是怎么生成的，我们无需关心。由于这个函数返回值是数据段限长，也就是 64M，所以最终的 p 值被调整为了以每个进程的线性地址空间视角下的地址偏移，大家可以仔细想想怎么算的。
+	p = (unsigned long) create_tables((char *)p,argc,envc);		// 构造参数表 刚刚仅仅是往参数表里面丢入了需要的字符串常量值信息，现在就需要真正把参数表构建起来。最后，将 sp 返回给 p，这个 p 将作为一个新的栈顶指针，给即将要完成替换的 /bin/sh 程序
+	/*
+	* create_tables() parses the env- and arg-strings in new user
+	* memory and creates the pointer tables from them, and puts their
+	* addresses on the "stack", returning the new stack pointer value.
+
+	static unsigned long * create_tables(char * p,int argc,int envc) {
+		unsigned long *argv,*envp;
+		unsigned long * sp;
+
+		sp = (unsigned long *) (0xfffffffc & (unsigned long) p);
+		sp -= envc+1;
+		envp = sp;
+		sp -= argc+1;
+		argv = sp;
+		put_fs_long((unsigned long)envp,--sp);
+		put_fs_long((unsigned long)argv,--sp);
+		put_fs_long((unsigned long)argc,--sp);
+		while (argc-->0) {
+			put_fs_long((unsigned long) p,argv++);
+			while (get_fs_byte(p++); // nothing ;
+		}
+		put_fs_long(0,argv);
+		while (envc-->0) {
+			put_fs_long((unsigned long) p,envp++);
+			while (get_fs_byte(p++)); // nothing 
+		}
+		put_fs_long(0,envp);
+		return sp;
+	}
+	*/
+	current->brk = ex.a_bss +
+		(current->end_data = ex.a_data +
+		(current->end_code = ex.a_text));
+	current->start_stack = p & 0xfffff000;
+	current->euid = e_uid;
+	current->egid = e_gid;
+	i = ex.a_text+ex.a_data;
+	while (i&0xfff)
+		put_fs_byte(0,(char *) (i++));
+	// 设置 eip 和 esp，完成摇身一变 其实本质上就是，代码指针 eip 和栈指针 esp 指向了一个新的地方。代码指针 eip 决定了 CPU 将执行哪一段指令，栈指针 esp 决定了 CPU 压栈操作的位置，以及读取栈空间数据的位置，在高级语言视角下就是局部变量以及函数调用链的栈帧。所以这两行代码，第一行重新设置了代码指针 eip 的值，指向 /bin/sh 这个 a.out 格式文件的头结构 exec 中的 a_entry 字段，表示该程序的入口地址。第二行重新设置了栈指针 esp 的值，指向了我们经过一路计算得到的 p，也就是图中 sp 的值。将这个值作为新的栈顶十分合理。eip 和 esp 都设置好了，那么程序摇身一变的工作，自然就结束了，非常简单。
+	eip[0] = ex.a_entry;		/* eip, magic happens :-) */
+	eip[3] = p;			/* stack pointer */
+	return 0;
+exec_error2:
+	iput(inode);
+exec_error1:
+	for (i=0 ; i<MAX_ARG_PAGES ; i++)
+		free_page(page[i]);
+	return(retval);
+}
+```
+- eip 调用方触发系统调用时由 CPU 压入栈空间中的 eip 的指针 。
+- tmp 是一个无用的占位参数。
+- filename 是 "/bin/sh"
+- argv 是 { "/bin/sh", NULL }
+- envp 是 { "HOME=/", NULL }
+```c
+int do_execve(...) {
+    // 检查文件类型和权限等
+    ...
+    // 读取文件的第一块数据到缓冲区
+    ...
+    // 如果是脚本文件，走这里
+    if (脚本文件判断逻辑) {
+        ...
+    }
+    // 如果是可执行文件，走这里
+    // 一堆校验可执行文件是否能执行的判断
+    ...
+    // 进程管理结构的调整
+    ...
+    // 释放进程占有的页面
+    ...
+    // 调整线性地址空间、参数列表、堆栈地址等
+    ...
+    // 设置 eip 和 esp，这里是 execve 变身大法的关键！
+    eip[0] = ex.a_entry;
+    eip[3] = p;
+    return 0;
+    ...
+}
+```
+## 调试Linux最早期的代码
+> https://github.com/yuan-xy/Linux-0.11
+
+## 缺页中断
+> 之前的进程 1 通过 fork + execve 这两个函数的组合，创建了一个新的进程去加载并执行了 shell 程序。我们仅仅是通过 execve，使得下一条 CPU 指令将会执行到 /bin/sh 程序所在的内存起始位置处，也就是 /bin/sh 头部结构中 a_entry 所描述的地址。但有个问题是，我们仅仅将 /bin/sh 文件的头部加载到了内存，其他部分并没有进行加载，那我们是怎么执行到的 /bin/sh 的程序指令呢？
+**跳转到一个不存在的地址会发生什么**
+> /bin/sh 这个文件并不是 Linux 0.11 源码里的内容，Linux 0.11 只管按照 a.out 这种格式去解读它，跳转到 a.out 格式头部数据结构 exec.a_entry 所指向的内存地址去执行指令。所以这个 a_entry 的值是多少，就完全取决于硬盘中 /bin/sh 这个文件是怎么构造的了，我们简单点，就假设它为 0，这表示随后的 CPU 将跳转到 0 地址处进行执行。当然，这个 0 仅仅表示逻辑地址，既没有进行分段，也没有进行分页。Linux 0.11 的每个进程是通过不同的局部描述符在线性地址空间中瓜分出不同的空间，一个进程占 64M。由于我们现在所处的代码是属于进程 2，所以逻辑地址 0 通过分段机制映射到线性地址空间，就是 0x8000000，表示 128M 位置处。128M 这个线性地址，随后将会通过分页机制的映射转化为物理地址，这才定位到最终的真实物理内存。可是，128M 这个线性地址并没有页表映射它，也就是因为上面我们说的，我们除了 /bin/sh 文件的头部加载到了内存外，其他部分并没有进行加载操作。再准确点说，是 0x8000000 这个线性地址的访问，遇到了页表项的存在位 P 等于 0 的情况。
+> 一旦遇到了这种情况，CPU 会触发一个中断：**页错误（Page-Fault）**
+```c
+void do_page_fault(..., unsigned long error_code) {
+    ...   
+    if (error_code & 1)
+        do_wp_page(error_code, address, current, user_esp);
+    else
+        do_no_page(error_code, address, current, user_esp);
+    ...
+}
+
+// memory.c
+// address 缺页产生的线性地址 0x8000000
+void do_no_page(unsigned long error_code,unsigned long address) {
+    int nr[4];	 // 一个数据块 1024 字节，所以一页内存需要读 4 个数据块
+    unsigned long tmp;
+    unsigned long page;
+    int block,i;
+
+    address &= 0xfffff000;	// 线性地址的页面地址 0x8000000
+    tmp = address - current->start_code;	// 计算相对于进程基址的偏移 0
+    if (!current->executable || tmp >= current->end_data) {
+        get_empty_page(address);
+        return;
+    }
+    if (share_page(tmp))
+        return;
+    if (!(page = get_free_page()))	// 寻找空闲的一页内存
+        oom();
+/* remember that 1 block is used for header */
+    block = 1 + tmp/BLOCK_SIZE;		// 计算这个地址在文件中的哪个数据块 1
+    for (i=0 ; i<4 ; block++,i++)	// 一个数据块 1024 字节，所以一页内存需要读 4 个数据块
+        nr[i] = bmap(current->executable,block);
+    bread_page(page,current->executable->i_dev,nr);
+    i = tmp + 4096 - current->end_data;
+    tmp = page + 4096;
+    while (i-- > 0) {
+        tmp--;
+        *(char *)tmp = 0;
+    }
+    if (put_page(page,address))		// 完成页表的映射
+        return;
+    free_page(page);
+    oom();
+}
+
+// memory.c
+// address 缺页产生的线性地址 0x8000000
+void do_no_page(unsigned long address) {
+    // 线性地址的页面地址 0x8000000
+    address &= 0xfffff000;
+    ...
+	 // 计算相对于进程基址的偏移 0
+    unsigned long tmp = address - current->start_code;	//  current->start_code 就是进程 2 的段基址，也是 128M。
+    ...
+	// 寻找空闲的一页内存
+    unsigned long page = get_free_page();	// get_free_page 是用汇编语言写的，其实就是去 mem_map[] 中寻找一个值为 0 的位置，这就表示找到了空闲内存。
+    ...
+	// 找到一页物理内存后，当然是把硬盘中的数据加载进来，下面的代码就是完成这个工作。
+	// 计算这个地址在文件中的哪个数据块 1
+    int block = 1 + tmp/BLOCK_SIZE;
+    // 一个数据块 1024 字节，所以一页内存需要读 4 个数据块
+    int nr[4];
+    for (int i=0 ; i<4 ; block++,i++)
+        nr[i] = bmap(current->executable,block);
+    bread_page(page,current->executable->i_dev,nr);
+    ...
+	// 完成页表的映射
+    put_page(page,address);
+}
+```
+> 缺页产生的线性地址，之前假设过了，是 0x8000000，也就是进程 2 自己线性地址空间的起始处 128M 这个位置。由于我们的页表映射是以页为单位的，所以首先计算出 address 所在的页，其实就是完成一次 4KB 的对齐。此时 address 对齐后仍然是 0x8000000。这个地址是整个线性地址空间的地址，但对于进程 2 自己来说，需要计算出相对于进程 2 的偏移地址，也就是去掉进程 2 的段基址部分。所以偏移地址 tmp 计算后等于 0，这和我们之前假设的 a_entry = 0 是一致的。
+> 从硬盘的哪个位置开始读呢？首先 0 内存地址，应该就对应着这个文件 0 号数据块，当然由于 /bin/sh 这个 a.out 格式的文件使用了 1 个数据块作为头部 exec 结构，所以我们跳过头部，从文件 1 号数据块开始读。读多少块呢？因为硬盘中的 1 个数据块为 1024 字节，而一页内存为 4096 字节，所以要读 4 块，这就是 nr[4] 的缘故。之后读取数据主要是两个函数，bmap 负责将相对于文件的数据块转换为相对于整个硬盘的数据块，比如这个文件的第 1 块数据，可能对应在整个硬盘的第 24 块的位置。bread_page 就是连续读取 4 个数据块到 1 页内存的函数，这个函数原理就复杂了，之后第五部分会讲这块的内容，但站在用户层的效果很好理解，就是把硬盘数据复制到内存罢了。
+```c
+// memory.c
+unsigned long put_page(unsigned long page,unsigned long address) {
+    unsigned long tmp, *page_table;
+    // 找到页目录项
+    page_table = (unsigned long *) ((address>>20) & 0xffc);
+    // 写入页目录项
+    tmp = get_free_page();
+    *page_table = tmp|7;
+    // 写入页表项
+    page_table = (unsigned long *) tmp;
+    page_table[(address>>12) & 0x3ff] = page | 7;
+    return page;
+}
+```
+
+## shell程序跑起来了
+> **xv6**是一个非常非常经典且简单的操作系统，是由麻省理工学院为操作系统工程的课程开发的一个教学目的的操作系统，所以非常适合操作系统的学习。
+```c
+// xv6-public sh.c
+int main(void) {
+    static char buf[100];
+    // 读取命令
+    while(getcmd(buf, sizeof(buf)) >= 0){
+        // 创建新进程
+        if(fork() == 0)
+            // 执行命令
+            runcmd(parsecmd(buf));
+        // 等待进程退出
+        wait();
+    }
+}
+```
+> 总得来说，shell 程序就是个死循环，它永远不会自己退出，除非我们手动终止了这个 shell 进程。在死循环里面，shell 就是不断读取（getcmd）我们用户输入的命令，创建一个新的进程（fork），在新进程里执行（runcmd）刚刚读取到的命令，最后等待（wait）进程退出，再次进入读取下一条命令的循环中。
+```c
+void runcmd(struct cmd *cmd) {
+    ...
+    struct execcmd ecmd = (struct execcmd*)cmd;
+    ...
+    exec(ecmd->argv[0], ecmd->argv);
+    ...
+}
+```
+
+## 操作系统启动完毕
+> 我们先是建立了操作系统的一些最基本的环境与管理结构，然后由进 0 fork 出处于用户态执行的进程 1，进程 1 加载了文件系统并打开终端文件，紧接着就 fork 出了进程 2，进程 2 通过我们刚刚讲述的 execve 函数将自己替换成了 shell 程序。
+> shell 程序有个特点，就是如果标准输入为一个普通文件，比如 /etc/rc，那么文件读取后就会使得 shell 进程退出，如果是字符设备文件，比如由我们键盘输入的 /dev/tty0，则不会使 shell 进程退出。所以，这个 /etc/rc 文件可以写一些你觉得在正式启动大死循环的 shell 程序之前，要做的一些事，比如启动一个登陆程序，让用户输入用户名和密码。
+```c
+// main.c
+void main(void) {
+    ...
+    if (!fork()) {
+        init();
+    }
+    for(;;) pause();
+}
+
+void init(void) {
+    ...
+    // 一个以 rc 为标准输入的 shell
+    if (!(pid=fork())) {
+        ...
+        open("/etc/rc",O_RDONLY,0);
+        execve("/bin/sh",argv_rc,envp_rc);
+    }
+    // 等待这个 shell 结束
+    if (pid>0)
+        while (pid != wait(&i))
+    ...
+    // 大的死循环，不再退出了
+    while (1) {
+        // 一个以 tty0 终端为标准输入的 shell
+        if (!(pid=fork())) {
+            ...
+            (void) open("/dev/tty0",O_RDWR,0);
+            execve("/bin/sh",argv,envp);
+        }
+        // 这个 shell 退出了继续进大的死循环
+        while (1)
+            if (pid == wait(&i))
+                break;
+        ...
+    }
+}
+```
+
+## 第四部分总结
+1. 第一部分 | 进入内核前的苦力活 完成了执行 main 方法前的准备工作，如加载内核代码，开启保护模式，开启分页机制等工作，对应内核源码中 boot 文件夹里的三个汇编文件 bootsect.s setup.s head.s。
+2. 第二部分 | 大战前期的初始化工作 完成了内核中各种管理结构的初始化，如内存管理结构初始化 mem_init，进程调度管理结构初始化 shed_init 等，对应 main 方法中的 xxx_init 系列方法。
+3. 第三部分 | 一个新进程的诞生 讲述了 fork 函数的原理，也就是进程 0 创建进程 1 的过程，对应 main 方法中的 fork 函数。
+4. 第四部分 | shell 程序的到来 讲述了从加载根文件系统到最终创建出与用户交互的 shell 进程的过程，对应 main 方法中的 init 函数。
+**至此操作系统启动完毕，达到怠速状态。**
+```c
+--- 第一部分 进入内核前的苦力活 ---
+bootsect.s
+setup.s
+head.s
+
+main.c
+void main(void) {
+--- 第二部分 大战前期的初始化工作 ---
+    mem_init(main_memory_start,memory_end);
+    trap_init();
+    blk_dev_init();
+    chr_dev_init();
+    tty_init();
+    time_init();
+    sched_init();
+    buffer_init(buffer_memory_end);
+    hd_init();
+    floppy_init();
+    sti();
+--- 第三部分 一个新进程的诞生 ---
+    move_to_user_mode();
+    if (!fork()) {
+--- 第四部分 shell程序的到来 ---
+        init();
+    }
+    for(;;) pause();
+}
+```
