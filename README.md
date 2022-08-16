@@ -13,6 +13,7 @@
 - [X] https://github.com/google/leveldb/blob/main/doc/index.md
 - [X] https://github.com/sunym1993/flash-linux0.11-talk
 - [X] https://github.com/qiangmzsx/Software-Engineering-at-Google
+- [ ] https://codecapsule.com/2012/11/07/ikvs-implementing-a-key-value-store-table-of-contents/
 
 # 官方技术博客
 
