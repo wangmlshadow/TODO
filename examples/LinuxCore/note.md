@@ -1,8 +1,10 @@
-# Linux 0.11核心代码
+# 记一个最近看的将Linux内核的系列文章
+- 作者：闪客 低并发编程（微信公众号）
+- Github：https://github.com/sunym1993/flash-linux0.11-talk
+- Github：https://github.com/mengchaobbbigrui/Linux-0.11code
 
-> repo: https://github.com/sunym1993/flash-linux0.11-talk
-> repo：https://github.com/mengchaobbbigrui/Linux-0.11code
 
+> 以下是笔记内容
 ## 最开始的两行代码
 
 首先了解一下寄存器：
@@ -3530,4 +3532,1113 @@ void main(void) {
 }
 ```
 
-## 
+## 用键盘输入一条命令
+> cat info.txt | wc -l
+**为什么我们按下键盘后，屏幕上就会出现如此的变化呢？**
+> 首先，得益于 第16回 | 控制台初始化 tty_init 中讲述的一行代码。
+```c
+// console.c
+void con_init(void) {
+    ...
+    set_trap_gate(0x21,&keyboard_interrupt);
+    ...
+}
+```
+> 我们成功将键盘中断绑定在了 keyboard_interrupt 这个中断处理函数上，也就是说当我们按下键盘 'c' 时，CPU 的中断机制将会被触发，最终执行到这个 keyboard_interrupt 函数中。
+```c
+// keyboard.s
+keyboard_interrupt:
+    ...
+    // 读取键盘扫描码
+    inb $0x60,%al
+    ...
+    // 调用对应按键的处理函数
+    call *key_table(,%eax,4)
+    ...
+    // 0 作为参数，调用 do_tty_interrupt
+    pushl $0
+    call do_tty_interrupt
+    ...
+```
+> 首先通过 IO 端口操作，从键盘中读取了刚刚产生的键盘扫描码，就是刚刚按下 'c' 的时候产生的键盘扫描码。随后，在 key_table 中寻找不同按键对应的不同处理函数，比如普通的一个字母对应的字符 'c' 的处理函数为 do_self，该函数会将扫描码转换为 ASCII 字符码，并将自己放入一个队列里，我们稍后再说这部分的细节。接下来，就是调用 do_tty_interrupt 函数，见名知意就是处理终端的中断处理函数，注意这里传递了一个参数 0。
+```c
+// tty_io.c
+void do_tty_interrupt(int tty) {
+    copy_to_cooked(tty_table+tty);
+}
+
+void copy_to_cooked(struct tty_struct * tty) {
+    ...
+}
+```
+> 这个函数几乎什么都没做，将 keyboard_interrupt 时传入的参数 0，作为 tty_table 的索引，找到 tty_table 中的第 0 项作为下一个函数的入参，仅此而已。
+> tty_table 是终端设备表，在 Linux 0.11 中定义了三项，分别是控制台、串行终端 1 和串行终端 2。
+```c
+// tty.h
+struct tty_struct tty_table[] = {
+    {
+        {...},
+        0,          /* initial pgrp */
+        0,          /* initial stopped */
+        con_write,
+        {0,0,0,0,""},       /* console read-queue */
+        {0,0,0,0,""},       /* console write-queue */
+        {0,0,0,0,""}        /* console secondary queue */
+    },
+    {...},
+    {...}
+};
+```
+> 我们用的往屏幕上输出内容的终端，就是 0 号索引位置处的控制台终端，所以我将另外两个终端定义的代码省略掉了。tty_table 终端设备表中的每一项结构，是 tty_struct，用来描述一个终端的属性。
+```c
+struct tty_struct {
+    struct termios termios;
+    int pgrp;
+    int stopped;
+    void (*write)(struct tty_struct * tty);
+    struct tty_queue read_q;
+    struct tty_queue write_q;
+    struct tty_queue secondary;
+};
+
+struct tty_queue {
+    unsigned long data;
+    unsigned long head;
+    unsigned long tail;
+    struct task_struct * proc_list;
+    char buf[TTY_BUF_SIZE];
+};
+```
+> termios 是定义了终端的各种模式，包括读模式、写模式、控制模式等
+> void (*write)(struct tty_struct * tty) 是一个接口函数，在刚刚的 tty_table 中我们也可以看出被定义为了 con_write，也就是说今后我们调用这个 0 号终端的写操作时，将会调用的是这个 con_write 函数，这不就是接口思想么。
+> 还有三个队列分别为读队列 read_q，写队列 write_q 以及一个辅助队列 secondary。
+```c
+// tty_io.c
+void do_tty_interrupt(int tty) {
+    copy_to_cooked(tty_table+tty);
+}
+
+void copy_to_cooked(struct tty_struct * tty) {
+    signed char c;
+    while (!EMPTY(tty->read_q) && !FULL(tty->secondary)) {
+        // 从 read_q 中取出字符
+        GETCH(tty->read_q,c);
+        ...
+        // 这里省略了一大坨行规则处理代码
+        ...
+        // 将处理过后的字符放入 secondary
+        PUTCH(c,tty->secondary);
+    }
+    wake_up(&tty->secondary.proc_list);
+}
+```
+> 在 copy_to_cooked 函数里就是个大循环，只要读队列 read_q 不为空，且辅助队列 secondary 没有满，就不断从 read_q 中取出字符，经过一大坨的处理，写入 secondary 队列里。否则，就唤醒等待这个辅助队列 secondary 的进程，之后怎么做就由进程自己决定。
+```c
+#define IUCLC   0001000
+#define _I_FLAG(tty,f)  ((tty)->termios.c_iflag & f)
+#define I_UCLC(tty) _I_FLAG((tty),IUCLC)
+
+void copy_to_cooked(struct tty_struct * tty) {
+    ...
+    // 这里省略了一大坨行规则处理代码
+    if (I_UCLC(tty))
+        c=tolower(c);
+    ...
+}
+```
+> 这一大坨有太多太多的 if 判断，但都是围绕着同一个目的，我们举其中一个简单的例子。通过判断 tty 中的 termios，来决定对读出的字符 c 做一些处理。在这里，就是判断 termios 中的 c_iflag 中的第 4 位是否为 1，来决定是否要将读出的字符 c 由大写变为小写。
+> 这个 termios 就是定义了终端的模式。
+```c
+struct termios {
+    unsigned long c_iflag;      /* input mode flags */
+    unsigned long c_oflag;      /* output mode flags */
+    unsigned long c_cflag;      /* control mode flags */
+    unsigned long c_lflag;      /* local mode flags */
+    unsigned char c_line;       /* line discipline */
+    unsigned char c_cc[NCCS];   /* control characters */
+};
+```
+**一、读队列 read_q 里的字符是什么时候放进去的？**
+```c
+// keyboard.s
+keyboard_interrupt:
+    ...
+    // 读取键盘扫描码
+    inb $0x60,%al
+    ...
+    // 调用对应按键的处理函数
+    call *key_table(,%eax,4)
+    ...
+    // 0 作为参数，调用 do_tty_interrupt
+    pushl $0
+    call do_tty_interrupt
+    ...
+
+// keyboard.s
+key_table:
+    .long none,do_self,do_self,do_self  /* 00-03 s0 esc 1 2 */
+    .long do_self,do_self,do_self,do_self   /* 04-07 3 4 5 6 */
+    ...
+    .long do_self,do_self,do_self,do_self   /* 20-23 d f g h */
+    ...
+```
+> 普通的字符 abcd 这种，对应的处理函数是 do_self
+```c
+// keyboard.s
+do_self:
+    ...
+    // 扫描码转换为 ASCII 码
+    lea key_map,%ebx
+    1: movb (%ebx,%eax),%al
+    ...
+    // 放入队列
+    call put_queue
+```
+> 最后调用了 put_queue 函数，顾名思义放入队列
+```c
+// tty_io.c
+struct tty_queue * table_list[]={
+    &tty_table[0].read_q, &tty_table[0].write_q,
+    &tty_table[1].read_q, &tty_table[1].write_q,
+    &tty_table[2].read_q, &tty_table[2].write_q
+};
+
+// keyboard.s
+put_queue:
+    ...
+    movl table_list,%edx # read-queue for console
+    movl head(%edx),%ecx
+    ...
+```
+> put_queue 正是操作了我们 tty_table 数组中的零号位置，也就是控制台终端 tty 的 read_q 队列，进行入队操作。
+**二、放入 secondary 队列之后呢？**
+> 这就涉及到上层进程调用终端的读函数，将这个字符取走了。上层经过库函数、文件系统函数等，最终会调用到 tty_read 函数，将字符从 secondary 队列里取走。
+```c
+// tty_io.c
+int tty_read(unsigned channel, char * buf, int nr) {
+    ...
+    GETCH(tty->secondary,c);
+    ...
+}
+```
+> 取走后要干嘛，那就是上层应用程序去决定的事情了。
+> 假如要写到控制台终端，那上层应用程序又会经过库函数、文件系统函数等层层调用，最终调用到 tty_write 函数。
+```c
+// tty_io.
+int tty_write(unsigned channel, char * buf, int nr) {
+    ...
+    PUTCH(c,tty->write_q);
+    ...
+    tty->write(tty);
+    ...
+}
+```
+> 这个函数首先会将字符 c 放入 write_q 这个队列，然后调用 tty 里设定的 write 函数。
+> 终端控制台这个 tty 我们之前说了，初始化的 write 函数是 con_write，也就是 console 的写函数。
+```c
+// console.c
+void con_write(struct tty_struct * tty) {
+      ...
+}
+```
+
+## shell程序读取你的命令
+**shell 程序如何读取到你输入的这条命令的。**
+> 现状：
+> 第一，我们键盘输入的字符，此时已经到达了控制台终端 tty 结构中的 secondary 这个队列里。
+> 第二，shell 程序将通过上层的 read 函数调用，来读取这些字符。
+```c
+// xv6-public sh.c
+int main(void) {
+    static char buf[100];
+    // 读取命令
+    while(getcmd(buf, sizeof(buf)) >= 0){
+        // 创建新进程
+        if(fork() == 0)
+            // 执行命令
+            runcmd(parsecmd(buf));
+        // 等待进程退出
+        wait();
+    }
+}
+
+int getcmd(char *buf, int nbuf) {
+    ...
+    gets(buf, nbuf);
+    ...
+}
+
+char* gets(char *buf, int max) {
+    int i, cc;
+    char c;
+  
+    for(i=0; i+1 < max; ){
+      cc = read(0, &c, 1);
+      if(cc < 1)
+        break;
+      buf[i++] = c;
+      if(c == '\n' || c == '\r')		// shell 程序会通过 getcmd 函数最终调用到 read 函数一个字符一个字符读入，直到读到了换行符（\n 或 \r）的时候，才返回。
+        break;
+    }
+    buf[i] = '\0';
+    return buf;		// 读入的字符在 buf 里，遇到换行符后，这些字符将作为一个完整的命令，传入给 runcmd 函数，真正执行这个命令。
+}
+```
+> read 函数是怎么把之前键盘输入并转移到 secondary 这个队列里的字符给读出来的。
+> read 函数是个用户态的库函数，最终会通过系统调用中断，执行 sys_read 函数。
+```c
+// read_write.c
+// fd = 0, count = 1
+int sys_read(unsigned int fd,char * buf,int count) {
+    struct file * file = current->filp[fd];
+    // 校验 buf 区域的内存限制
+    verify_area(buf,count);
+    struct m_inode * inode = file->f_inode;
+    // 管道文件
+    if (inode->i_pipe)
+        return (file->f_mode&1)?read_pipe(inode,buf,count):-EIO;
+    // 字符设备文件
+    if (S_ISCHR(inode->i_mode))
+        return rw_char(READ,inode->i_zone[0],buf,count,&file->f_pos);
+    // 块设备文件
+    if (S_ISBLK(inode->i_mode))
+        return block_read(inode->i_zone[0],&file->f_pos,buf,count);
+    // 目录文件或普通文件
+    if (S_ISDIR(inode->i_mode) || S_ISREG(inode->i_mode)) {
+        if (count+file->f_pos > inode->i_size)
+            count = inode->i_size - file->f_pos;
+        if (count<=0)
+            return 0;
+        return file_read(inode,file,buf,count);
+    }
+    // 不是以上几种，就报错
+    printk("(Read)inode->i_mode=%06o\n\r",inode->i_mode);
+    return -EINVAL;
+}
+```
+> 这个最上层的 sys_read，把读取管道文件、字符设备文件、块设备文件、目录文件或普通文件，都放在了同一个方法里处理，这个方法作为所有读操作的统一入口，由此也可以看出 linux 下一切皆文件的思想。
+> read 的第一个参数是 0，也就是 0 号文件描述符，之前我们在讲第四部分的时候说过，shell 进程是由进程 1 通过 fork 创建出来的，而进程 1 在 init 的时候打开了 /dev/tty0 作为 0 号文件描述符。
+> 而这个 /dev/tty0 的文件类型，也就是其 inode 结构中表示文件类型与属性的 i_mode 字段，表示为字符型设备，所以最终会走到 rw_char 这个子方法下，文件系统的第一层划分就走完了。
+```c
+// char_dev.c
+static crw_ptr crw_table[]={
+    NULL,       /* nodev */
+    rw_memory,  /* /dev/mem etc */
+    NULL,       /* /dev/fd */
+    NULL,       /* /dev/hd */
+    rw_ttyx,    /* /dev/ttyx */
+    rw_tty,     /* /dev/tty */  
+    NULL,       /* /dev/lp */
+    NULL};      /* unnamed pipes */
+
+int rw_char(int rw,int dev, char * buf, int count, off_t * pos) {
+    crw_ptr call_addr;
+
+    if (MAJOR(dev)>=NRDEVS)
+        return -ENODEV;
+    if (!(call_addr=crw_table[MAJOR(dev)]))
+        return -ENODEV;
+    return call_addr(rw,MINOR(dev),buf,count,pos);
+}
+
+// char_dev.c
+static int rw_ttyx(int rw,unsigned minor,char * buf,int count,off_t * pos) {
+    return ((rw==READ)?tty_read(minor,buf,count):
+        tty_write(minor,buf,count));
+}
+```
+> 根据 dev 这个参数，计算出主设备号为 4，次设备号为 0，所以将会走到 rw_ttyx 方法继续执行。
+> 根据 rw == READ 走到读操作分支 tty_read，这就终于快和上一讲的故事接上了。
+```c
+// tty_io.c
+// channel=0, nr=1
+int tty_read(unsigned channel, char * buf, int nr) {	// channel 为 0，表示 tty_table 里的控制台终端这个具体的设备。buf 是我们要读取的数据拷贝到内存的位置指针，也就是用户缓冲区指针。nr 为 1，表示我们要读出 1 个字符。整个方法，其实就是不断从 secondary 队列里取出字符，然后放入 buf 指所指向的内存。
+    struct tty_struct * tty = &tty_table[channel];
+    char c, * b=buf;
+    while (nr>0) {
+        ...
+        if (EMPTY(tty->secondary) ...) {		// 如果要读取的字符数 nr 被减为 0，说明已经完成了读取任务，或者说 secondary 队列为空，说明不论你任务完没完成我都没有字符让你继续读了，那此时调用 sleep_if_empty 将线程阻塞，等待被唤醒。
+            sleep_if_empty(&tty->secondary);
+            continue;
+        }
+        do {
+            GETCH(tty->secondary,c);	//  GETCH 就是个宏，改变 secondary 队列的队头队尾指针，你自己写个队列数据结构，也是这样的操作，不再展开讲解。
+            ...
+            put_fs_byte(c,b++);
+            if (!--nr) break;
+        } while (nr>0 && !EMPTY(tty->secondary));
+        ...
+    }
+    ...
+    return (b-buf);
+}
+
+#define GETCH(queue,c) \
+(void)({c=(queue).buf[(queue).tail];INC((queue).tail);})
+#define EMPTY(a) ((a).head == (a).tail)
+
+
+// sleep_if_empty(&tty->secondary);
+
+// tty_io.c
+static void sleep_if_empty(struct tty_queue * queue) {
+    cli();
+    while (!current->signal && EMPTY(*queue))		// 当我们再次按下键盘，使得 secondary 队列中有字符时，也就打破了为空的条件，此时就应该将之前的进程唤醒了
+        interruptible_sleep_on(&queue->proc_list);
+    sti();
+}
+
+// sched.c
+void interruptible_sleep_on(struct task_struct **p) {
+    struct task_struct *tmp;
+    ...
+    tmp=*p;
+    *p=current;
+repeat: current->state = TASK_INTERRUPTIBLE;	// 将当前进程的状态设置为可中断等待。
+    schedule();
+    if (*p && *p != current) {
+        (**p).state=0;
+        goto repeat;
+    }
+    *p=tmp;
+    if (tmp)
+        tmp->state=0;
+}
+
+
+// tty_io.c
+void do_tty_interrupt(int tty) {
+    copy_to_cooked(tty_table+tty);
+}
+
+void copy_to_cooked(struct tty_struct * tty) {
+    ...
+    wake_up(&tty->secondary.proc_list);		// 在 copy_to_cooked 里，在将 read_q 队列中的字符处理后放入 secondary 队列中的最后一步，就是唤醒 wake_up 这个队列里的等待进程。
+}
+
+// sched.c
+void wake_up(struct task_struct **p) {		// wake_up 函数更为简单，就是修改一下状态，使其变成可运行的状态。
+    if (p && *p) {
+        (**p).state=0;
+    }
+}
+```
+
+## 进程的阻塞与唤醒
+**进程状态**
+```c
+// shed.h
+#define TASK_RUNNING 0      // 运行态
+#define TASK_INTERRUPTIBLE 1    // 可中断等待状态。
+#define TASK_UNINTERRUPTIBLE 2  // 不可中断等待状态
+#define TASK_ZOMBIE 3       // 僵死状态
+#define TASK_STOPPED 4      // 停止
+```
+> 当进程首次被创建时，也就是 fork 函数执行后，它的初始状态是 0，也就是运行态。
+```c
+// system_call.s
+_sys_fork:
+    ...
+    call _copy_process
+    ...
+
+// fork.c
+int copy_process(...) {
+    ...
+    p->state = TASK_RUNNING;
+    ...
+}
+```
+> 只有当处于运行态的进程，才会被调度机制选中，送入 CPU 开始执行。
+```c
+// sched.c
+void schedule (void) {
+    ...
+    if ((*p)->state == TASK_RUNNING && (*p)->counter > c) {
+        ...
+        next = i;
+    }
+    ...
+    switch_to (next);
+}
+```
+> 使得一个进程阻塞的方法非常简单，并不需要什么魔法，只需要将其 state 字段，变成非 TASK_RUNNING 也就是非运行态，即可让它暂时不被 CPU 调度，也就达到了阻塞的效果。
+> 同样，唤醒也非常简单，就是再将对应进程的 state 字段变成 TASK_RUNNING 即可。
+> Linux 0.11 中的阻塞与唤醒，就是 sleep_on 和 wake_up 函数。
+```c
+// sched.c
+void sleep_on (struct task_struct **p) {
+    struct task_struct *tmp;
+    ...
+    tmp = *p;		// 通过每一个当前任务所在的代码块中的 tmp 变量，总能找到上一个正在同样等待一个资源的进程，因此也就形成了一个链表。
+    *p = current;
+    current->state = TASK_UNINTERRUPTIBLE; 	// sleep_on 函数将 state 变为 TASK_UNINTERRUPTIBLE
+    schedule();
+    if (tmp)
+        tmp->state = 0;
+
+// sched.c
+void wake_up (struct task_struct **p) {
+    (**p).state = 0;	// wake_up 函数将 state 变回为 TASK_RUNNING，也就是 0。
+}
+}
+```
+> 当某进程调用了 wake_up 函数唤醒 proc_list 上指向的第一个任务时，改任务变会在 sleep_on 函数执行完 schedule() 后被唤醒并执行下面的代码，把 tmp 指针指向的上一个任务也同样唤醒。唤醒后谁能优先抢到资源，那就得看调度的时机以及调度的机制了，对我们来说相当于听天由命了。
+```c
+// sched.c
+void sleep_on (struct task_struct **p) {
+    struct task_struct *tmp;
+    ...
+    tmp = *p;
+    *p = current;
+    current->state = TASK_UNINTERRUPTIBLE;
+    schedule();
+    if (tmp)
+        tmp->state = 0;
+}
+```
+> 现在我们的 shell 进程，通过 read 函数，中间经过了层层封装，以及后面经过了阻塞与唤醒这一番折腾后，终于把键盘输入的字符们，成功由 tty 中的 secondary 队列，读取并存放与 buf 指向的内存地址处。
+
+
+## 解析并执行shell命令
+```c
+// xv6-public sh.c
+int main(void) {
+    static char buf[100];
+    // 读取命令
+    while(getcmd(buf, sizeof(buf)) >= 0){
+        // 创建新进程
+        if(fork() == 0)
+            // 执行命令
+            runcmd(parsecmd(buf));
+        // 等待进程退出
+        wait();
+    }
+}
+```
+> 首先 parsecmd 函数会将读取到 buf 的字符串命令做解析，生成一个 cmd 结构的变量，传入 runcmd 函数中。
+```c
+// xv6-public sh.c
+void runcmd(struct cmd *cmd) {
+    ...
+    switch(cmd->type) {		// 根据 cmd 的 type 字段，来判断应该如何执行这个命令。
+        ...
+        case EXEC:	 		// 直接执行，也即 EXEC
+        ecmd = (struct execcmd*)cmd;
+        ...
+        exec(ecmd->argv[0], ecmd->argv);
+        ... 
+        break;
+    
+        case REDIR: ...
+        case LIST: ...		// 如果命令中有分号 ; 说明是多条命令的组合，那么就当作 LIST 拆分成多条命令依次执行。
+        case PIPE: ...		// 如果命令中有竖线 | 说明是管道命令，那么就当作 PIPE 拆分成两个并发的命令，同时通过管道串联起输入端和输出端，来执行。
+        case BACK: ...
+    }
+}
+```
+> [root@linux0.11] cat info.txt | wc -l
+> 如何解析一个pipe命令
+```c
+// xv6-public sh.c
+void runcmd(struct cmd *cmd) {
+    ...
+    int p[2];
+    ...
+    case PIPE:
+        pcmd = (struct pipecmd*)cmd;
+        pipe(p);		// 这个 pipe 函数，最终会调用到系统调用的 sys_pipe
+        if(fork() == 0) {	// 关闭（close）了 1 号标准输出文件描述符，复制（dup）了 p[1] 并填充在了 1 号文件描述符上（因为刚刚关闭后空缺出来了），然后又把 p[0] 和 p[1] 都关闭（close）了。最终的效果就是，将 1 号文件描述符，也就是标准输出，指向了 p[1] 管道的写口，也就是 p[1] 原来所指向的地方。
+            close(1);
+            dup(p[1]);
+            close(p[0]);
+            close(p[1]);
+            runcmd(pcmd->left);
+        }
+        if(fork() == 0) {	// 最终是将 0 号标准输入指向了管道的读口。
+            close(0);
+            dup(p[0]);
+            close(p[0]);
+            close(p[1]);
+            runcmd(pcmd->right);
+        }
+        close(p[0]);		// 父进程仅仅是将 p[0] 和 p[1] 都关闭掉了，也就是说，父进程执行的 pipe，仅仅是为两个子进程申请的文件描述符，对于自己来说并没有用处。
+        close(p[1]);
+        wait(0);
+        wait(0);
+        break;
+    ...
+}
+```
+> pipe 就是创建一个管道，将传入数组 p 的 p[0] 指向这个管道的读口，p[1] 指向这个管道的写口，画图就是这样子的。这个管道的本质是一个文件，但是是属于管道类型的文件，所以它的本质的本质实际上是一块内存。这块内存被当作管道文件对上层提供了像访问文件一样的读写接口，只不过其中一个进程只能读，另一个进程只能写，所以再次抽象一下就像一个管道一样，数据从一端流向了另一段
+```c
+// fs/pipe.c
+int sys_pipe(unsigned long * fildes) {
+    struct m_inode * inode;
+    struct file * f[2];
+    int fd[2];
+
+    for(int i=0,j=0; j<2 && i<NR_FILE; i++)
+        if (!file_table[i].f_count)
+            (f[j++]=i+file_table)->f_count++;
+    ...
+    for(int i=0,j=0; j<2 && i<NR_OPEN; i++)
+        if (!current->filp[i]) {
+            current->filp[ fd[j]=i ] = f[j];
+            j++;
+        }
+    ...
+    if (!(inode=get_pipe_inode())) {		//  pipe 方法中并不是打开一个已存在的文件，而是创建一个新的管道类型的文件，具体是通过 get_pipe_inode 方法，返回一个 inode 结构。然后，填充了两个 file 结构的数据，都指向了这个 inode，其中一个的 f_mode 为 1 也就是写，另一个是 2 也就是读。（f_mode 为文件的操作模式属性，也就是 RW 位的值）
+        current->filp[fd[0]] = current->filp[fd[1]] = NULL;
+        f[0]->f_count = f[1]->f_count = 0;
+        return -1;
+    }
+    f[0]->f_inode = f[1]->f_inode = inode;
+    f[0]->f_pos = f[1]->f_pos = 0;
+    f[0]->f_mode = 1;       /* read */
+    f[1]->f_mode = 2;       /* write */
+    put_fs_long(fd[0],0+fildes);
+    put_fs_long(fd[1],1+fildes);
+    return 0;
+}
+```
+> 创建管道的方法 get_pipe_inode 方法如下
+```c
+// fs.h
+#define PIPE_HEAD(inode) ((inode).i_zone[0])
+#define PIPE_TAIL(inode) ((inode).i_zone[1])
+
+// inode.c
+struct m_inode * get_pipe_inode(void) {
+    struct m_inode *inode = get_empty_inode();		// 正常文件的 inode 中的 i_size 表示文件大小，而管道类型文件的 i_size 表示供管道使用的这一页内存的起始地址。
+    inode->i_size=get_free_page();
+    inode->i_count = 2; /* sum of readers/writers */
+    PIPE_HEAD(*inode) = PIPE_TAIL(*inode) = 0;
+    inode->i_pipe = 1;
+    return inode;
+}
+```
+> 不论是更换当前目录的 REDIR 也就是 cd 命令，还是用分号分隔开的 LIST 命令，还是我们上面讲到的 PIPE 命令，最终都会被拆解成一个个可以被解析为 EXEC 类型的命令。
+
+## 读硬盘数据全流程
+> 将硬盘中的数据读入内存，听起来是个很简单的事情，但操作系统要考虑的问题很多。
+**如果让你来设计这个函数**
+> 设计这个函数第一个要指定的参数就可以是 fd 了，它仅仅是个数字。当然，之所以能这样方便，就要感谢刚刚说的文件系统建设以及打开文件的逻辑这两项工作
+> 之后，我们得告诉这个函数，把这个 fd 指向的硬盘中的文件，复制到内存中的哪个位置，复制多大。
+> 那更简单了，内存中的位置，我们用一个表示地址值的参数 buf，复制多大，我们用 count 来表示，单位是字节。
+```c
+// read_write.c
+int sys_read(unsigned int fd,char * buf,int count) {
+    struct file * file;
+    struct m_inode * inode;
+
+    if (fd>=NR_OPEN || count<0 || !(file=current->filp[fd]))
+        return -EINVAL;
+    if (!count)
+        return 0;
+    verify_area(buf,count);
+    inode = file->f_inode;
+    if (inode->i_pipe)
+        return (file->f_mode&1)?read_pipe(inode,buf,count):-EIO;
+    if (S_ISCHR(inode->i_mode))
+        return rw_char(READ,inode->i_zone[0],buf,count,&file->f_pos);
+    if (S_ISBLK(inode->i_mode))
+        return block_read(inode->i_zone[0],&file->f_pos,buf,count);
+    if (S_ISDIR(inode->i_mode) || S_ISREG(inode->i_mode)) {
+        if (count+file->f_pos > inode->i_size)
+            count = inode->i_size - file->f_pos;
+        if (count<=0)
+            return 0;
+        return file_read(inode,file,buf,count);
+    }
+    printk("(Read)inode->i_mode=%06o\n\r",inode->i_mode);
+    return -EINVAL;
+}
+```
+> 首先我先简化一下，去掉一些错误校验逻辑等旁路分支，并添加上注释。
+```c
+// read_write.c
+int sys_read(unsigned int fd,char * buf,int count) {
+    struct file * file = current->filp[fd];
+    // 校验 buf 区域的内存限制
+    verify_area(buf,count);
+    struct m_inode * inode = file->f_inode;
+    // 管道文件
+    if (inode->i_pipe)
+        return (file->f_mode&1)?read_pipe(inode,buf,count):-EIO;
+    // 字符设备文件
+    if (S_ISCHR(inode->i_mode))
+        return rw_char(READ,inode->i_zone[0],buf,count,&file->f_pos);
+    // 块设备文件
+    if (S_ISBLK(inode->i_mode))
+        return block_read(inode->i_zone[0],&file->f_pos,buf,count);
+    // 目录文件或普通文件
+    if (S_ISDIR(inode->i_mode) || S_ISREG(inode->i_mode)) {
+        if (count+file->f_pos > inode->i_size)
+            count = inode->i_size - file->f_pos;
+        if (count<=0)
+            return 0;
+        return file_read(inode,file,buf,count);
+    }
+    // 不是以上几种，就报错
+    printk("(Read)inode->i_mode=%06o\n\r",inode->i_mode);
+    return -EINVAL;
+}
+```
+> 由此也可以注意到，操作系统源码的设计比我刚刚说的更通用，我刚刚只让你设计了读取硬盘的函数，但其实在 Linux 下一切皆文件，所以这个函数将管道文件、字符设备文件、块设备文件、目录文件、普通文件分别指向了不同的具体实现。
+> 对 buf 区域的内存做校验 verify_area
+```c
+// fork.c
+void verify_area(void * addr,int size) {		// addr 就是刚刚的 buf，size 就是刚刚的 count。然后这里又将 addr 赋值给了 start 变量。所以代码开始，start 就表示要复制到的内存的起始地址，size 就是要复制的字节数。
+    unsigned long start;
+    start = (unsigned long) addr;	// 我们假设要复制到的内存的起始地址 start 和要复制的字节数 size 在图中的那个位置。那么开始的两行计算代码。就是将 start 和 size 按页对齐一下。
+    size += start & 0xfff;
+    start &= 0xfffff000;
+    start += get_base(current->ldt[2]);	// 由于每个进程有不同的数据段基址，所以还要加上它。
+    while (size>0) {
+        size -= 4096;		// Linux 0.11 对内存是以 4K 为一页单位来划分内存的，所以内存看起来就是一个个 4K 的小格子。
+        write_verify(start);// write_verify 将会对这些页进行写页面验证，如果页面存在但不可写，则执行 un_wp_page 复制页面。
+        start += 4096;
+    }
+}
+```
+> 每个进程的 LDT 表，由 Linux 创建进程时的代码给规划好了。具体说来，就是如上图所示，每个进程的线性地址范围，是(进程号)*64M ~  (进程号+1)*64M
+> 而对于进程本身来说，都以为自己是从零号地址开始往后的 64M，所以传入的 start 值也是以零号地址为起始地址算出来的。
+> 但现在经过系统调用进入 sys_write 后会切换为内核态，内核态访问数据会通过基地址为 0 的全局描述符表中的数据段来访问数据。所以，start 要加上它自己进程的数据段基址，才对。
+```c
+// memory.c
+void write_verify(unsigned long address) {
+    unsigned long page;
+    if (!( (page = *((unsigned long *) ((address>>20) & 0xffc)) )&1))
+        return;
+    page &= 0xfffff000;
+    page += ((address>>10) & 0xffc);
+    if ((3 & *(unsigned long *) page) == 1)  /* non-writeable, present */
+        un_wp_page((unsigned long *) page);		// un_wp_page 意思就是取消页面的写保护，就是写时复制的原理
+    return;
+}
+```
+**执行读操作 file_read**
+```c
+// read_write.c
+int sys_read(unsigned int fd,char * buf,int count) {
+    ...
+    return file_read(inode,file,buf,count);
+}
+
+// file_dev.c
+int file_read(struct m_inode * inode, struct file * filp, char * buf, int count) {
+    int left,chars,nr;
+    struct buffer_head * bh;
+    left = count;
+    while (left) {	// 每次读入一个块的数据，直到入参所要求的大小全部读完为止。
+        if (nr = bmap(inode,(filp->f_pos)/BLOCK_SIZE)) { 	//  bmap 获取全局数据块号
+            if (!(bh=bread(inode->i_dev,nr)))	//  bread 将数据块的数据复制到缓冲区put_fs_byte 再一个字节一个字节地将缓冲区数据复制到用户指定的内存中。
+                break;
+        } else
+            bh = NULL;
+        nr = filp->f_pos % BLOCK_SIZE;
+        chars = MIN( BLOCK_SIZE-nr , left );
+        filp->f_pos += chars;
+        left -= chars;
+        if (bh) {		// put_fs_byte 再一个字节一个字节地将缓冲区数据复制到用户指定的内存中。
+            char * p = nr + bh->b_data;
+            while (chars-->0)
+                put_fs_byte(*(p++),buf++);
+            brelse(bh);
+        } else {
+            while (chars-->0)
+                put_fs_byte(0,buf++);
+        }
+    }
+    inode->i_atime = CURRENT_TIME;
+    return (count-left)?(count-left):-ERROR;
+}
+
+// inode.c 
+int bmap(struct m_inode * inode,int block) {
+    return _bmap(inode,block,0);
+}
+
+static int _bmap(struct m_inode * inode,int block,int create) {
+    ...
+    if (block<0)
+        ...
+    if (block >= 7+512+512*512)
+        ...
+    if (block<7) 
+        // zone[0] 到 zone[7] 采用直接索引，可以索引小于 7 的块号
+        ...
+    if (block<512)
+        // zone[7] 是一次间接索引，可以索引小于 512 的块号
+        ...
+    // zone[8] 是二次间接索引，可以索引大于 512 的块号
+}
+```
+> 整个条件判断的结构是根据 block 来划分的。block 就是要读取的块号，之所以要划分，就是因为 inode 在记录文件所在块号时，采用了多级索引的方式。
+> 那我们刚开始读，块号肯定从零开始，所以我们就先看 block<7，通过直接索引这种最简单的方式读的代码。
+```c
+// inode.c
+static int _bmap(struct m_inode * inode,int block,int create) {
+    ...
+    if (block<7) {
+        if (create && !inode->i_zone[block])	// 由于 create = 0，也就是并不需要创建一个新的数据块，所以里面的 if 分支也没了。
+            if (inode->i_zone[block]=new_block(inode->i_dev)) {
+                inode->i_ctime=CURRENT_TIME;
+                inode->i_dirt=1;
+            }
+        return inode->i_zone[block];
+    }
+    ...
+}
+```
+>  bmap 返回的，就是要读入的块号，从全局看在块设备的哪个逻辑块号下。
+> bread：将 bmap 获取的数据块号读入到高速缓冲块
+```c
+// file_dev.c
+int file_read(struct m_inode * inode, struct file * filp, char * buf, int count) {
+    ...
+    while (left) {
+        if (nr = bmap(inode,(filp->f_pos)/BLOCK_SIZE)) {		// nr 就是具体的数据块号，作为其中其中一个参数，传入下一个函数 bread。
+            if (!(bh=bread(inode->i_dev,nr)))	// bread 这个方法的入参除了数据块号 block（就是刚刚传入的 nr）外，还有 inode 结构中的 i_dev，表示设备号。
+    }
+}
+
+// buffer.c
+struct buffer_head * bread(int dev,int block) {
+    struct buffer_head * bh = getblk(dev,block);	// getblk 方法，就是根据设备号 dev 和数据块号 block，申请到一个缓冲块。
+    if (bh->b_uptodate)
+        return bh;
+    ll_rw_block(READ,bh);
+    wait_on_buffer(bh);
+    if (bh->b_uptodate)
+        return bh;
+    brelse(bh);
+    return NULL;
+}
+```
+>  bread 方法就是根据一个设备号 dev 和一个数据块号 block，将这个数据块的数据，从硬盘复制到缓冲区里。
+> 先根据 hash 结构快速查找这个 dev 和 block 是否有对应存在的缓冲块。如果没有，那就从之前建立好的双向链表结构的头指针 free_list 开始寻找，直到找到一个可用的缓冲块。具体代码逻辑，还包含当缓冲块正在被其他进程使用，或者缓冲块对应的数据已经被修改时的处理逻辑，你可以看一看，关键流程我已加上了注释。
+```c
+// buffer.c
+struct buffer_head * bread(int dev,int block) {
+    struct buffer_head * bh = getblk(dev,block);
+    ...
+}
+
+struct buffer_head * getblk(int dev,int block) {
+    struct buffer_head * tmp, * bh;
+
+repeat:
+    // 先从 hash 结构中找
+    if (bh = get_hash_table(dev,block))
+        return bh;
+
+    // 如果没有就从 free_list 开始找遍双向链表
+    tmp = free_list;
+    do {
+        if (tmp->b_count)
+            continue;
+        if (!bh || BADNESS(tmp)<BADNESS(bh)) {
+            bh = tmp;
+            if (!BADNESS(tmp))
+                break;
+        }
+    } while ((tmp = tmp->b_next_free) != free_list);
+
+    // 如果还没找到，那就说明没有缓冲块可用了，就先阻塞住等一会
+    if (!bh) {
+        sleep_on(&buffer_wait);
+        goto repeat;
+    }
+
+    // 到这里已经说明申请到了缓冲块，但有可能被其他进程上锁了
+    // 如果上锁了的话，就先等等
+    wait_on_buffer(bh);
+    if (bh->b_count)
+        goto repeat;
+
+    // 到这里说明缓冲块已经申请到，且没有上锁
+    // 但还得看 dirt 位，也就是有没有被修改
+    // 如果被修改了，就先重新从硬盘中读入新数据
+    while (bh->b_dirt) {
+        sync_dev(bh->b_dev);
+        wait_on_buffer(bh);
+        if (bh->b_count)
+            goto repeat;
+    }
+    if (find_buffer(dev,block))
+        goto repeat;
+
+    // 给刚刚获取到的缓冲头 bh 重新赋值
+    // 并调整在双向链表和 hash 表中的位置
+    bh->b_count=1;
+    bh->b_dirt=0;
+    bh->b_uptodate=0;
+    remove_from_queues(bh);
+    bh->b_dev=dev;
+    bh->b_blocknr=block;
+    insert_into_queues(bh);
+    return bh;
+}
+```
+> 经过 getblk 之后，我们就在内存中，找到了一处缓冲块，用来接下来存储硬盘中指定数据块的数据。那接下来的一步，自然就是把硬盘中的数据复制到这里啦，没错，ll_rw_block 就是干这个事的。
+> 再然后put_fs_byte 方法，一个字节一个字节地，将缓冲区里的数据，复制到用户指定的内存 buf 中去了，当然，只会复制 count 字节。
+```c
+// segment.h
+extern _inline void
+put_fs_byte (char val, char *addr) {
+    __asm__ ("movb %0,%%fs:%1"::"r" (val),"m" (*addr));
+}
+
+// segment.h
+extern _inline void
+put_fs_byte (char val, char *addr) {
+    _asm mov ebx,addr
+    _asm mov al,val;
+    _asm mov byte ptr fs:[ebx],al;
+}
+```
+
+## 读取硬盘数据的细节
+>  ll_rw_block 方法负责把硬盘中指定数据块中的数据，复制到 getblk 方法申请到的缓冲块里
+```c
+// buffer.c
+struct buffer_head * bread(int dev,int block) {
+    ...
+    ll_rw_block(READ,bh);
+    ...
+}
+
+void ll_rw_block (int rw, struct buffer_head *bh) {
+    ...
+    make_request(major, rw, bh);
+}
+
+struct request request[NR_REQUEST] = {0};
+static void make_request(int major,int rw, struct buffer_head * bh) {
+    struct request *req;    
+    ...
+    // 从 request 队列找到一个空位
+    if (rw == READ)
+        req = request+NR_REQUEST;
+    else
+        req = request+((NR_REQUEST*2)/3);
+    while (--req >= request)
+        if (req->dev<0)
+            break;
+    ...
+    // 构造 request 结构
+    req->dev = bh->b_dev;
+    req->cmd = rw;
+    req->errors=0;
+    req->sector = bh->b_blocknr<<1;
+    req->nr_sectors = 2;
+    req->buffer = bh->b_data;
+    req->waiting = NULL;
+    req->bh = bh;
+    req->next = NULL;
+    add_request(major+blk_dev,req);
+}
+
+// ll_rw_blk.c
+static void add_request (struct blk_dev_struct *dev, struct request *req) {
+    struct request * tmp;
+    req->next = NULL;
+    cli();
+    // 清空 dirt 位
+    if (req->bh)
+        req->bh->b_dirt = 0;
+    // 当前请求项为空，那么立即执行当前请求项
+    if (!(tmp = dev->current_request)) {
+        dev->current_request = req;
+        sti();
+        (dev->request_fn)();
+        return;
+    }
+    // 插入到链表中
+    for ( ; tmp->next ; tmp=tmp->next)
+        if ((IN_ORDER(tmp,req) ||
+            !IN_ORDER(tmp,tmp->next)) &&
+            IN_ORDER(req,tmp->next))
+            break;
+    req->next=tmp->next;
+    tmp->next=req;
+    sti();
+}
+```
+> 调用链很长，主线是从 request 数组中找到一个空位，然后作为链表项插入到 request 链表中。没错 request 是一个 32 大小的数组，里面的每一个 request 结构间通过 next 指针相连又形成链表。
+> request 的具体结构是。
+```c
+// blk.h
+struct request {
+    int dev;        /* -1 if no request */
+    int cmd;        /* READ or WRITE */
+    int errors;
+    unsigned long sector;
+    unsigned long nr_sectors;
+    char * buffer;
+    struct task_struct * waiting;
+    struct buffer_head * bh;
+    struct request * next;
+};
+```
+> 表示一个读盘的请求参数。
+> 那是谁不断从这个 request 队列中取出 request 结构并对硬盘发起读请求操作的呢？这里 Linux 0.11 有个很巧妙的设计，我们看看。
+```c
+// blk.h
+struct blk_dev_struct {
+    void (*request_fn)(void);
+    struct request * current_request;
+};
+
+// ll_rw_blk.c
+struct blk_dev_struct blk_dev[NR_BLK_DEV] = {
+    { NULL, NULL },     /* no_dev */
+    { NULL, NULL },     /* dev mem */
+    { NULL, NULL },     /* dev fd */
+    { NULL, NULL },     /* dev hd */
+    { NULL, NULL },     /* dev ttyx */
+    { NULL, NULL },     /* dev tty */
+    { NULL, NULL }      /* dev lp */
+};
+
+static void make_request(int major,int rw, struct buffer_head * bh) {
+    ...
+    add_request(major+blk_dev,req);
+}
+
+static void add_request (struct blk_dev_struct *dev, struct request *req) {
+    ...
+    // 当前请求项为空，那么立即执行当前请求项
+    if (!(tmp = dev->current_request)) {	// 当设备的当前请求项为空，也就是第一次收到硬盘操作请求时，会立即执行该设备的 request_fn 方法，这便是整个读盘循环的最初推手。
+        ...
+        (dev->request_fn)();
+        ...
+    }
+    ...
+}
+```
+> 当设备的当前请求项为空，也就是第一次收到硬盘操作请求时，会立即执行该设备的 request_fn 方法，这便是整个读盘循环的最初推手。当前设备的设备号是 3，也就是硬盘，会从 blk_dev 数组中取索引下标为 3 的设备结构。在 第20回 | 硬盘初始化 hd_init 的时候，设备号为 3 的设备结构的 request_fn 被赋值为硬盘请求函数 do_hd_request 了。
+```c
+// hd.c
+void hd_init(void) {
+    blk_dev[3].request_fn = do_hd_request;
+    ...
+}
+```
+> 刚刚的 request_fn 背后的具体执行函数，就是这个 do_hd_request。
+```c
+#define CURRENT (blk_dev[MAJOR_NR].current_request)
+// hd.c
+void do_hd_request(void) {
+    ...
+    unsigned int dev = MINOR(CURRENT->dev);
+    unsigned int block = CURRENT->sector;
+    ...
+    nsect = CURRENT->nr_sectors;
+    ...
+    if (CURRENT->cmd == WRITE) {	// 可以看到最终会根据当前请求是写（WRITE）还是读（READ），在调用 hd_out 时传入不同的参数。
+        hd_out(dev,nsect,sec,head,cyl,WIN_WRITE,&write_intr);	// hd_out 就是读硬盘的最最最最底层的函数了。
+        ...
+    } else if (CURRENT->cmd == READ) {
+        hd_out(dev,nsect,sec,head,cyl,WIN_READ,&read_intr);
+    } else
+        panic("unknown hd-command");
+}
+
+// hd.c
+static void hd_out(unsigned int drive,unsigned int nsect,unsigned int sect,
+        unsigned int head,unsigned int cyl,unsigned int cmd,
+        void (*intr_addr)(void))
+{
+    ...
+    do_hd = intr_addr;
+    outb_p(hd_info[drive].ctl,HD_CMD);
+    port=HD_DATA;
+    outb_p(hd_info[drive].wpcom>>2,++port);
+    outb_p(nsect,++port);
+    outb_p(sect,++port);
+    outb_p(cyl,++port);
+    outb_p(cyl>>8,++port);
+    outb_p(0xA0|(drive<<4)|head,++port);
+    outb(cmd,++port);
+}
+```
+> 可以看到，最底层的读盘请求，其实就是向一堆外设端口做读写操作。
+> 读硬盘就是，往除了第一个以外的后面几个端口写数据，告诉要读硬盘的哪个扇区，读多少。然后再从 0x1F0 端口一个字节一个字节的读数据。这就完成了一次硬盘读操作。当然，从 0x1F0 端口读出硬盘数据，是在硬盘读好数据并放在 0x1F0 后发起的硬盘中断，进而执行硬盘中断处理函数里进行的。
+> 在 第20回 | 硬盘初始化 hd_init 的时候，将 hd_interrupt 设置为了硬盘中断处理函数，中断号是 0x2E，代码如下。
+```c
+// hd.c
+void hd_init(void) {
+    ...
+    set_intr_gate(0x2E,&hd_interrupt);
+    ...
+}
+
+// 所以，在硬盘读完数据后，发起 0x2E 中断，便会进入到 hd_interrupt 方法里。
+// system_call.s
+_hd_interrupt:
+    ...
+    xchgl _do_hd,%edx	// 这个方法主要是调用 do_hd 方法，这个方法是一个指针，就是高级语言里所谓的接口，读操作的时候，将会指向 read_intr 这个具体实现。
+    ...
+    call *%edx
+    ...
+    iret
+
+// hd.c
+void do_hd_request(void) {
+    ...
+    } else if (CURRENT->cmd == READ) {
+        hd_out(dev,nsect,sec,head,cyl,WIN_READ,&read_intr);
+    }
+    ...
+}
+
+static void hd_out(..., void (*intr_addr)(void)) {
+    ...
+    do_hd = intr_addr;
+    ...
+}
+
+// hd.c
+#define port_read(port,buf,nr) \
+__asm__("cld;rep;insw"::"d" (port),"D" (buf),"c" (nr):"cx","di")
+
+static void read_intr(void) {
+    ...
+    // 从数据端口读出数据到内存
+    port_read(HD_DATA,CURRENT->buffer,256);	//  port_read 宏定义的方法，从端口 HD_DATA 中读 256 次数据，每次读一个字，总共就是 512 字节的数据。
+    CURRENT->errors = 0;
+    CURRENT->buffer += 512;
+    CURRENT->sector++;
+    // 还没有读完，则直接返回等待下次
+    if (--CURRENT->nr_sectors) {	// 如果没有读完发起读盘请求时所要求的字节数，那么直接返回，等待下次硬盘触发中断并执行到 read_intr 即可。
+        do_hd = &read_intr;
+        return;
+    }
+    // 所有扇区都读完了
+    // 删除本次都请求项
+    end_request(1);		// 如果已经读完了，就调用 end_request 方法将请求项清除掉，然后再次调用 do_hd_request 方法循环往复
+    // 再次触发硬盘操作
+    do_hd_request();
+}
+
+
+// blk.h
+#define CURRENT (blk_dev[MAJOR_NR].current_request)
+
+extern inline void end_request(int uptodate) {
+    DEVICE_OFF(CURRENT->dev);
+    if (CURRENT->bh) {
+        CURRENT->bh->b_uptodate = uptodate;
+        unlock_buffer(CURRENT->bh);
+    }
+    ...
+    wake_up(&CURRENT->waiting);		// 第一个唤醒了该请求项所对应的进程 &CURRENT->waiting，告诉这个进程我这个请求项的读盘操作处理完了，你继续执行吧。
+    wake_up(&wait_for_request);		// 另一个是唤醒了因为 request 队列满了没有将请求项插进来的进程 &wait_for_request。
+	// 随后，将当前设备的当前请求项 CURRENT，即 request 数组里的一个请求项 request 的 dev 置空，并将当前请求项指向链表中的下一个请求项。这样，do_hd_request 方法处理的就是下一个请求项的内容了，直到将所有请求项都处理完毕。整个流程就这样形成了闭环，通过这样的机制，可以做到好似存在一个额外的进程，在不断处理 request 链表里的读写盘请求一样。
+    CURRENT->dev = -1;
+    CURRENT = CURRENT->next;
+}
+```
