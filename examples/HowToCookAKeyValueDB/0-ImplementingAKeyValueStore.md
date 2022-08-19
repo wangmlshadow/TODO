@@ -1,4 +1,6 @@
-# Implementing a Key-Value Stor
+> 这是一个关于如何设计一个key-value存储的系列文章的翻译
+
+# Implementing a Key-Value Store
 
 > Published by [Emmanuel Goossaert](https://codecapsule.com/author/admin/) on [November 7, 2012](https://codecapsule.com/2012/11/)
 
