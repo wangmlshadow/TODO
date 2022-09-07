@@ -1,0 +1,18 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/root/git/TODO/examples/cmake-tutorial/cmake-3.24.0-tutorial-source/Step1/tutorial.cxx
+cmath
+-
+cstdlib
+-
+iostream
+-
+string
+-
+
