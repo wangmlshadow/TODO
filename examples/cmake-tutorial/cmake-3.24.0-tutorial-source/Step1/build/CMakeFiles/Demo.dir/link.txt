@@ -1,1 +1,0 @@
-/usr/bin/c++   -std=c++0x  -O0 -Wall -g -ggdb  -rdynamic CMakeFiles/Demo.dir/tutorial.cxx.o  -o Demo 
