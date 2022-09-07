@@ -13,8 +13,8 @@
 - [X] https://github.com/google/leveldb/blob/main/doc/index.md
 - [X] https://github.com/sunym1993/flash-linux0.11-talk
 - [X] https://github.com/qiangmzsx/Software-Engineering-at-Google
-- [ ] https://codecapsule.com/2012/11/07/ikvs-implementing-a-key-value-store-table-of-contents/
-- [ ] [Coding for SSDs – Part 1: Introduction and Table of Contents | Code Capsule](https://codecapsule.com/2014/02/12/coding-for-ssds-part-1-introduction-and-table-of-contents/)
+- [X] https://codecapsule.com/2012/11/07/ikvs-implementing-a-key-value-store-table-of-contents/
+- [X] [Coding for SSDs – Part 1: Introduction and Table of Contents | Code Capsule](https://codecapsule.com/2014/02/12/coding-for-ssds-part-1-introduction-and-table-of-contents/)
 - [X] [SPDK: What is SPDK](https://spdk.io/doc/about.html)
 
 ## Projects
