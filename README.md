@@ -16,6 +16,8 @@
 - [X] https://codecapsule.com/2012/11/07/ikvs-implementing-a-key-value-store-table-of-contents/
 - [X] [Coding for SSDs – Part 1: Introduction and Table of Contents | Code Capsule](https://codecapsule.com/2014/02/12/coding-for-ssds-part-1-introduction-and-table-of-contents/)
 - [X] [SPDK: What is SPDK](https://spdk.io/doc/about.html)
+- [ ] [Archives | Code Capsule](https://codecapsule.com/archive/)
+- [ ] https://www.fuxuemingzhu.cn/ddia 数据密集型应用系统设计
 
 ## Projects
 
