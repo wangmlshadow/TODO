@@ -18,8 +18,16 @@
 - [X] [SPDK: What is SPDK](https://spdk.io/doc/about.html)
 - [ ] [Archives | Code Capsule](https://codecapsule.com/archive/)
 - [ ] https://www.fuxuemingzhu.cn/ddia 数据密集型应用系统设计
+- [ ] https://tonydeng.github.io/sdn-handbook/dpdk/spdk.html spdk
 
 ## Projects
 
 - [ ] https://zookeeper.apache.org/releases.html
 - [ ] https://cmake.org/cmake/help/latest/guide/tutorial/index.html
+
+## Books
+
+* [ ] **Designing Data-Intensive Applications**
+* [ ] **从Paxos到ZooKeeper**
+* [ ] **OpenStack的设计与实践**
+* [ ] **Ceph CookBook**
